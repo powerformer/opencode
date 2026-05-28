@@ -50,9 +50,24 @@ const OpenAIChatAssistantToolCall = Schema.Struct({
 })
 type OpenAIChatAssistantToolCall = Schema.Schema.Type<typeof OpenAIChatAssistantToolCall>
 
+const OpenAIChatUserTextContent = Schema.Struct({
+  type: Schema.tag("text"),
+  text: Schema.String,
+})
+
+const OpenAIChatUserImageContent = Schema.Struct({
+  type: Schema.tag("image_url"),
+  image_url: Schema.Struct({
+    url: Schema.String,
+  }),
+})
+
+const OpenAIChatUserContent = Schema.Union([OpenAIChatUserTextContent, OpenAIChatUserImageContent])
+type OpenAIChatUserContent = Schema.Schema.Type<typeof OpenAIChatUserContent>
+
 const OpenAIChatMessage = Schema.Union([
   Schema.Struct({ role: Schema.Literal("system"), content: Schema.String }),
-  Schema.Struct({ role: Schema.Literal("user"), content: Schema.String }),
+  Schema.Struct({ role: Schema.Literal("user"), content: Schema.Union([Schema.String, Schema.Array(OpenAIChatUserContent)]) }),
   Schema.Struct({
     role: Schema.Literal("assistant"),
     content: Schema.NullOr(Schema.String),
@@ -188,14 +203,31 @@ const lowerToolCall = (part: ToolCallPart): OpenAIChatAssistantToolCall => ({
 const openAICompatibleReasoningContent = (native: unknown) =>
   isRecord(native) && typeof native.reasoning_content === "string" ? native.reasoning_content : undefined
 
-const lowerUserMessage = Effect.fn("OpenAIChat.lowerUserMessage")(function* (message: OpenAIChatRequestMessage) {
-  const content: TextPart[] = []
-  for (const part of message.content) {
-    if (!ProviderShared.supportsContent(part, ["text"]))
-      return yield* ProviderShared.unsupportedContent("OpenAI Chat", "user", ["text"])
-    content.push(part)
+const lowerUserContent = Effect.fn("OpenAIChat.lowerUserContent")(function* (
+  part: LLMRequest["messages"][number]["content"][number],
+) {
+  if (part.type === "text") return { type: "text" as const, text: part.text }
+  if (part.type === "media" && part.mediaType.startsWith("image/")) {
+    return {
+      type: "image_url" as const,
+      image_url: {
+        url: ProviderShared.mediaDataUrl(part),
+      },
+    }
   }
-  return { role: "user" as const, content: ProviderShared.joinText(content) }
+  if (part.type === "media") return yield* invalid(`OpenAI Chat user media content only supports images, got ${part.mediaType}`)
+  return yield* ProviderShared.unsupportedContent("OpenAI Chat", "user", ["text", "media"])
+})
+
+const lowerUserMessage = Effect.fn("OpenAIChat.lowerUserMessage")(function* (message: OpenAIChatRequestMessage) {
+  const content = yield* Effect.forEach(message.content, lowerUserContent)
+  if (content.every((part) => part.type === "text")) {
+    return {
+      role: "user" as const,
+      content: ProviderShared.joinText(content),
+    }
+  }
+  return { role: "user" as const, content }
 })
 
 const lowerAssistantMessage = Effect.fn("OpenAIChat.lowerAssistantMessage")(function* (

@@ -182,17 +182,49 @@ describe("OpenAI Chat route", () => {
     }),
   )
 
-  it.effect("rejects unsupported user media content", () =>
+  it.effect("lowers user image media content into image_url blocks", () =>
     Effect.gen(function* () {
-      const error = yield* LLMClient.prepare(
+      const prepared = yield* LLMClient.prepare(
         LLM.request({
           id: "req_media",
           model,
-          messages: [Message.user({ type: "media", mediaType: "image/png", data: "AAECAw==" })],
+          messages: [
+            Message.user([
+              { type: "text", text: "Describe this image." },
+              { type: "media", mediaType: "image/png", data: "AAECAw==" },
+            ]),
+          ],
+        }),
+      )
+
+      expect(prepared.body).toMatchObject({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Describe this image." },
+              { type: "image_url", image_url: { url: "data:image/png;base64,AAECAw==" } },
+            ],
+          },
+        ],
+        stream: true,
+        stream_options: { include_usage: true },
+      })
+    }),
+  )
+
+  it.effect("rejects unsupported non-image user media content", () =>
+    Effect.gen(function* () {
+      const error = yield* LLMClient.prepare(
+        LLM.request({
+          id: "req_media_invalid",
+          model,
+          messages: [Message.user({ type: "media", mediaType: "application/pdf", data: "AAECAw==" })],
         }),
       ).pipe(Effect.flip)
 
-      expect(error.message).toContain("OpenAI Chat user messages only support text content for now")
+      expect(error.message).toContain("OpenAI Chat user media content only supports images")
     }),
   )
 

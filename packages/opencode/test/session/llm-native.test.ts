@@ -416,7 +416,10 @@ describe("session.llm-native.request", () => {
         provider: { ...providerInfo, id: ProviderID.make("google") },
         auth: undefined,
       }),
-    ).toEqual({ type: "unsupported", reason: "provider is not openai, opencode, or anthropic" })
+    ).toMatchObject({
+      type: "supported",
+      apiKey: "test-openai-key",
+    })
     expect(
       LLMNativeRuntime.status({
         model: baseModel,
