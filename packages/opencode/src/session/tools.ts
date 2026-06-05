@@ -105,7 +105,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
               output,
             )
-            if (!options.abortSignal?.aborted) {
+            if (shouldCompleteToolCall(output, options.abortSignal)) {
               yield* input.processor.completeToolCall(options.toolCallId, output)
             }
             return output
@@ -193,7 +193,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             })),
             content: result.content,
           }
-          if (!opts.abortSignal?.aborted) {
+          if (shouldCompleteToolCall(output, opts.abortSignal)) {
             yield* input.processor.completeToolCall(opts.toolCallId, output)
           }
           return output
@@ -204,5 +204,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
 
   return tools
 })
+
+function shouldCompleteToolCall(output: { attachments?: MessageV2.FilePart[] }, abortSignal: AbortSignal | undefined) {
+  if (abortSignal?.aborted) return false
+  return output.attachments?.some((attachment) => attachment.mime.startsWith("image/")) !== true
+}
 
 export * as SessionTools from "./tools"

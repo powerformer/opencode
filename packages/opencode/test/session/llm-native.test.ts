@@ -631,6 +631,54 @@ describe("session.llm-native.request", () => {
     }),
   )
 
+  it.effect("preserves OpenAI-compatible interleaved reasoning through native request lowering", () =>
+    Effect.gen(function* () {
+      const prepared = yield* prepareNativeRequest({
+        model: {
+          ...baseModel,
+          id: ModelID.make("deepseek-reasoner"),
+          providerID: ProviderID.make("deepseek"),
+          api: {
+            id: "deepseek-reasoner",
+            url: "https://api.deepseek.test/v1",
+            npm: "@ai-sdk/openai-compatible",
+          },
+          capabilities: {
+            ...baseModel.capabilities,
+            interleaved: { field: "reasoning_details" },
+          },
+        },
+        apiKey: "test-key",
+        messages: [
+          {
+            role: "assistant",
+            content: [storedSession.text("Done.")],
+            providerOptions: {
+              openaiCompatible: {
+                reasoning_content: "thinking",
+                reasoning_details: "details",
+              },
+            },
+          },
+        ],
+      })
+
+      expect(prepared).toMatchObject({
+        route: "openai-compatible-chat",
+        body: {
+          messages: [
+            {
+              role: "assistant",
+              content: "Done.",
+              reasoning_content: "thinking",
+              reasoning_details: "details",
+            },
+          ],
+        },
+      })
+    }),
+  )
+
   it.effect("references stored OpenAI reasoning items by id", () =>
     expectOpenAIResponsesRequest({
       history: [
