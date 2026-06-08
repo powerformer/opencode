@@ -28,6 +28,8 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { RoleMarkerHallucinationError } from "./message-error"
+import { createRoleMarkerGuard } from "./role-marker-guard"
 
 const DOOM_LOOP_THRESHOLD = 3
 const log = Log.create({ service: "session.processor" })
@@ -77,6 +79,7 @@ interface ProcessorContext extends Input {
   blocked: boolean
   needsCompaction: boolean
   currentText: MessageV2.TextPart | undefined
+  currentTextGuard: ReturnType<typeof createRoleMarkerGuard> | undefined
   reasoningMap: Record<string, MessageV2.ReasoningPart>
 }
 
@@ -117,6 +120,7 @@ export const layer = Layer.effect(
         blocked: false,
         needsCompaction: false,
         currentText: undefined,
+        currentTextGuard: undefined,
         reasoningMap: {},
       }
       let aborted = false
@@ -635,24 +639,55 @@ export const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
+            ctx.currentTextGuard = createRoleMarkerGuard()
             yield* session.updatePart(ctx.currentText)
             return
 
           case "text-delta":
             if (!ctx.currentText) return
-            ctx.currentText.text += value.text
-            if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
-            yield* session.updatePartDelta({
-              sessionID: ctx.currentText.sessionID,
-              messageID: ctx.currentText.messageID,
-              partID: ctx.currentText.id,
-              field: "text",
-              delta: value.text,
-            })
+            ctx.currentTextGuard ??= createRoleMarkerGuard()
+            const guarded = ctx.currentTextGuard.feed(value.text)
+            if (guarded.text) {
+              ctx.currentText.text += guarded.text
+              if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
+              yield* session.updatePartDelta({
+                sessionID: ctx.currentText.sessionID,
+                messageID: ctx.currentText.messageID,
+                partID: ctx.currentText.id,
+                field: "text",
+                delta: guarded.text,
+              })
+            }
+            if (guarded.detection) {
+              throw new RoleMarkerHallucinationError({
+                code: "ROLE_MARKER_HALLUCINATION",
+                marker: guarded.detection.marker,
+                message: `Model emitted fabricated role marker ("${guarded.detection.marker}"). Response was truncated to prevent unauthorized instruction injection.`,
+              })
+            }
             return
 
-          case "text-end":
+          case "text-end": {
             if (!ctx.currentText) return
+            const flushed = ctx.currentTextGuard?.flush() ?? { text: "" }
+            if (flushed.text) {
+              ctx.currentText.text += flushed.text
+              yield* session.updatePartDelta({
+                sessionID: ctx.currentText.sessionID,
+                messageID: ctx.currentText.messageID,
+                partID: ctx.currentText.id,
+                field: "text",
+                delta: flushed.text,
+              })
+            }
+            if (flushed.detection) {
+              throw new RoleMarkerHallucinationError({
+                code: "ROLE_MARKER_HALLUCINATION",
+                marker: flushed.detection.marker,
+                message: `Model emitted fabricated role marker ("${flushed.detection.marker}"). Response was truncated to prevent unauthorized instruction injection.`,
+              })
+            }
+            if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             // oxlint-disable-next-line no-self-assign -- reactivity trigger
             ctx.currentText.text = ctx.currentText.text
             ctx.currentText.text = (yield* plugin.trigger(
@@ -681,7 +716,9 @@ export const layer = Layer.effect(
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             yield* session.updatePart(ctx.currentText)
             ctx.currentText = undefined
+            ctx.currentTextGuard = undefined
             return
+          }
 
           case "finish":
             return
@@ -709,6 +746,7 @@ export const layer = Layer.effect(
           ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
           yield* session.updatePart(ctx.currentText)
           ctx.currentText = undefined
+          ctx.currentTextGuard = undefined
         }
 
         for (const part of Object.values(ctx.reasoningMap)) {
