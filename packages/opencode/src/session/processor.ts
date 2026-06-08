@@ -25,6 +25,7 @@ import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { createRoleMarkerGuard } from "./role-marker-guard"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -71,6 +72,7 @@ interface ProcessorContext extends Input {
   blocked: boolean
   needsCompaction: boolean
   currentText: SessionV1.TextPart | undefined
+  currentTextGuard: ReturnType<typeof createRoleMarkerGuard> | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
 }
 
@@ -110,6 +112,7 @@ const layer = Layer.effect(
         blocked: false,
         needsCompaction: false,
         currentText: undefined,
+        currentTextGuard: undefined,
         reasoningMap: {},
       }
       let aborted = false
@@ -493,24 +496,51 @@ const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
+            ctx.currentTextGuard = createRoleMarkerGuard()
             yield* session.updatePart(ctx.currentText)
             return
 
           case "text-delta":
             if (!ctx.currentText) return
-            ctx.currentText.text += value.text
-            if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
-            yield* session.updatePartDelta({
-              sessionID: ctx.currentText.sessionID,
-              messageID: ctx.currentText.messageID,
-              partID: ctx.currentText.id,
-              field: "text",
-              delta: value.text,
-            })
+            ctx.currentTextGuard ??= createRoleMarkerGuard()
+            const guarded = ctx.currentTextGuard.feed(value.text)
+            if (guarded.text) {
+              ctx.currentText.text += guarded.text
+              if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
+              yield* session.updatePartDelta({
+                sessionID: ctx.currentText.sessionID,
+                messageID: ctx.currentText.messageID,
+                partID: ctx.currentText.id,
+                field: "text",
+                delta: guarded.text,
+              })
+            }
+            if (guarded.detection) {
+              throw new SessionV1.ContentFilterError({
+                message: `Model emitted fabricated role marker ("${guarded.detection.marker}"). Response was truncated to prevent unauthorized instruction injection.`,
+              })
+            }
             return
 
-          case "text-end":
+          case "text-end": {
             if (!ctx.currentText) return
+            const flushed = ctx.currentTextGuard?.flush() ?? { text: "" }
+            if (flushed.text) {
+              ctx.currentText.text += flushed.text
+              yield* session.updatePartDelta({
+                sessionID: ctx.currentText.sessionID,
+                messageID: ctx.currentText.messageID,
+                partID: ctx.currentText.id,
+                field: "text",
+                delta: flushed.text,
+              })
+            }
+            if (flushed.detection) {
+              throw new SessionV1.ContentFilterError({
+                message: `Model emitted fabricated role marker ("${flushed.detection.marker}"). Response was truncated to prevent unauthorized instruction injection.`,
+              })
+            }
+            if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             // oxlint-disable-next-line no-self-assign -- reactivity trigger
             ctx.currentText.text = ctx.currentText.text
             ctx.currentText.text = (yield* plugin.trigger(
@@ -529,7 +559,9 @@ const layer = Layer.effect(
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             yield* session.updatePart(ctx.currentText)
             ctx.currentText = undefined
+            ctx.currentTextGuard = undefined
             return
+          }
 
           case "finish":
             return
@@ -557,6 +589,7 @@ const layer = Layer.effect(
           ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
           yield* session.updatePart(ctx.currentText)
           ctx.currentText = undefined
+          ctx.currentTextGuard = undefined
         }
 
         for (const part of Object.values(ctx.reasoningMap)) {
