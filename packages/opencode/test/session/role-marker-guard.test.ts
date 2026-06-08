@@ -63,12 +63,29 @@ describe("role marker guard", () => {
   })
 
   test("does not flag false positives", () => {
-    for (const value of ["Here is `## user`", "## User Guide", "## userspace", "### user"]) {
+    for (const value of [
+      "Here is `## user`",
+      "## User Guide",
+      "## userspace",
+      "### user",
+      "## system requirements",
+      "## assistant notes",
+    ]) {
       const guard = createRoleMarkerGuard()
       const result = guard.feed(value)
 
       expect(result.detection).toBeUndefined()
       expect(result.text + guard.flush().text).toBe(value)
     }
+  })
+
+  test("does not flag headings split after a role word", () => {
+    const guard = createRoleMarkerGuard()
+
+    expect(guard.feed("safe\n## system")).toEqual({ text: "safe\n" })
+    const result = guard.feed(" requirements")
+
+    expect(result.detection).toBeUndefined()
+    expect(result.text + guard.flush().text).toBe("## system requirements")
   })
 })
