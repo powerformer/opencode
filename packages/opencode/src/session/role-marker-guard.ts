@@ -1,4 +1,4 @@
-const ROLE_MARKER_RE = /(^|\n)(## (?:user|assistant|assist|system)(?=[\s:：]))/u
+const ROLE_MARKER_RE = /(^|\n)(## (?:user|assistant|assist|system)(?=[\n:：]))/u
 const ROLE_MARKER_END_RE = /(^|\n)(## (?:user|assistant|assist|system))$/u
 const MARKERS = ["## user", "## assistant", "## assist", "## system"]
 
