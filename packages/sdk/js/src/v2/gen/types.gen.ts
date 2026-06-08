@@ -243,6 +243,15 @@ export type ContextOverflowError = {
   }
 }
 
+export type RoleMarkerHallucinationError = {
+  name: "RoleMarkerHallucinationError"
+  data: {
+    code: "ROLE_MARKER_HALLUCINATION"
+    marker: string
+    message: string
+  }
+}
+
 export type ApiError = {
   name: "APIError"
   data: {
@@ -442,6 +451,7 @@ export type AssistantMessage = {
     | MessageAbortedError
     | StructuredOutputError
     | ContextOverflowError
+    | RoleMarkerHallucinationError
     | ApiError
   parentID: string
   modelID: string
@@ -2610,6 +2620,7 @@ export type EventSessionError = {
       | MessageAbortedError
       | StructuredOutputError
       | ContextOverflowError
+      | RoleMarkerHallucinationError
       | ApiError
   }
 }

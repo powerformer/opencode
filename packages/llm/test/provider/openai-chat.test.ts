@@ -182,17 +182,49 @@ describe("OpenAI Chat route", () => {
     }),
   )
 
-  it.effect("rejects unsupported user media content", () =>
+  it.effect("lowers user image media content into image_url blocks", () =>
     Effect.gen(function* () {
-      const error = yield* LLMClient.prepare(
+      const prepared = yield* LLMClient.prepare(
         LLM.request({
           id: "req_media",
           model,
-          messages: [Message.user({ type: "media", mediaType: "image/png", data: "AAECAw==" })],
+          messages: [
+            Message.user([
+              { type: "text", text: "Describe this image." },
+              { type: "media", mediaType: "image/png", data: "AAECAw==" },
+            ]),
+          ],
+        }),
+      )
+
+      expect(prepared.body).toMatchObject({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Describe this image." },
+              { type: "image_url", image_url: { url: "data:image/png;base64,AAECAw==" } },
+            ],
+          },
+        ],
+        stream: true,
+        stream_options: { include_usage: true },
+      })
+    }),
+  )
+
+  it.effect("rejects unsupported non-image user media content", () =>
+    Effect.gen(function* () {
+      const error = yield* LLMClient.prepare(
+        LLM.request({
+          id: "req_media_invalid",
+          model,
+          messages: [Message.user({ type: "media", mediaType: "application/pdf", data: "AAECAw==" })],
         }),
       ).pipe(Effect.flip)
 
-      expect(error.message).toContain("OpenAI Chat user messages only support text content for now")
+      expect(error.message).toContain("OpenAI Chat user media content only supports images")
     }),
   )
 
@@ -276,6 +308,32 @@ describe("OpenAI Chat route", () => {
         { type: "step-start", index: 0 },
         { type: "reasoning-start", id: "reasoning-0" },
         { type: "reasoning-delta", id: "reasoning-0", text: "thinking" },
+        { type: "text-start", id: "text-0" },
+        { type: "text-delta", id: "text-0", text: "Hello" },
+        { type: "reasoning-end", id: "reasoning-0" },
+        { type: "text-end", id: "text-0" },
+        { type: "step-finish", index: 0, reason: "stop" },
+        { type: "finish", reason: "stop" },
+      ])
+    }),
+  )
+
+  it.effect("parses OpenAI-compatible reasoning details deltas", () =>
+    Effect.gen(function* () {
+      const body = sseEvents(
+        { choices: [{ delta: { reasoning_details: "details" } }] },
+        { choices: [{ delta: { content: "Hello" } }] },
+        { choices: [{ delta: {}, finish_reason: "stop" }] },
+      )
+
+      const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(body)))
+
+      expect(response.reasoning).toBe("details")
+      expect(response.text).toBe("Hello")
+      expect(response.events).toMatchObject([
+        { type: "step-start", index: 0 },
+        { type: "reasoning-start", id: "reasoning-0" },
+        { type: "reasoning-delta", id: "reasoning-0", text: "details" },
         { type: "text-start", id: "text-0" },
         { type: "text-delta", id: "text-0", text: "Hello" },
         { type: "reasoning-end", id: "reasoning-0" },

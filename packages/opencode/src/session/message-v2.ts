@@ -25,8 +25,8 @@ import { Effect, Schema, Types } from "effect"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import * as EffectLogger from "@opencode-ai/core/effect/logger"
 import { MessageError } from "./message-error"
-import { AuthError, OutputLengthError } from "./message-error"
-export { AuthError, OutputLengthError } from "./message-error"
+import { AuthError, OutputLengthError, RoleMarkerHallucinationError } from "./message-error"
+export { AuthError, OutputLengthError, RoleMarkerHallucinationError } from "./message-error"
 
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
 interface FetchDecompressionError extends Error {
@@ -1106,6 +1106,8 @@ export function fromError(
         },
       ).toObject()
     case OutputLengthError.isInstance(e):
+      return e
+    case RoleMarkerHallucinationError.isInstance(e):
       return e
     case LoadAPIKeyError.isInstance(e):
       return new AuthError(
