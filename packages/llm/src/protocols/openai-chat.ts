@@ -98,6 +98,9 @@ export const bodyFields = {
   stream_options: Schema.optional(Schema.Struct({ include_usage: Schema.Boolean })),
   store: Schema.optional(Schema.Boolean),
   reasoning_effort: Schema.optional(OpenAIOptions.OpenAIReasoningEffort),
+  enable_thinking: Schema.optional(Schema.Boolean),
+  thinking: Schema.optional(JsonObject),
+  chat_template_args: Schema.optional(JsonObject),
   max_tokens: Schema.optional(Schema.Number),
   temperature: Schema.optional(Schema.Number),
   top_p: Schema.optional(Schema.Number),
@@ -339,11 +342,17 @@ const lowerMessages = Effect.fn("OpenAIChat.lowerMessages")(function* (request: 
 const lowerOptions = Effect.fn("OpenAIChat.lowerOptions")(function* (request: LLMRequest) {
   const store = OpenAIOptions.store(request)
   const reasoningEffort = OpenAIOptions.reasoningEffort(request)
+  const options = request.providerOptions?.openai
   if (reasoningEffort && !OpenAIOptions.isReasoningEffort(reasoningEffort))
     return yield* invalid(`OpenAI Chat does not support reasoning effort ${reasoningEffort}`)
   return {
     ...(store !== undefined ? { store } : {}),
     ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+    ...(isRecord(options) && typeof options.enable_thinking === "boolean"
+      ? { enable_thinking: options.enable_thinking }
+      : {}),
+    ...(isRecord(options?.thinking) ? { thinking: options.thinking } : {}),
+    ...(isRecord(options?.chat_template_args) ? { chat_template_args: options.chat_template_args } : {}),
   }
 })
 

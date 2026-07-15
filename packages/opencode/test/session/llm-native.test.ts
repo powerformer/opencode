@@ -860,7 +860,12 @@ describe("session.llm-native.request", () => {
         llmClient,
         messages: [{ role: "user", content: "hello" }],
         tools: {},
-        providerOptions: { reasoningEffort: "high" },
+        providerOptions: {
+          reasoningEffort: "high",
+          enable_thinking: true,
+          thinking: { type: "enabled", clear_thinking: false },
+          chat_template_args: { enable_thinking: true },
+        },
         headers: {},
         abort: new AbortController().signal,
       })
@@ -871,7 +876,13 @@ describe("session.llm-native.request", () => {
       expect(captures).toEqual([
         {
           url: "https://api.amr.test/v1/chat/completions",
-          body: expect.objectContaining({ model: "deepseek-reasoner", reasoning_effort: "high" }),
+          body: expect.objectContaining({
+            model: "deepseek-reasoner",
+            reasoning_effort: "high",
+            enable_thinking: true,
+            thinking: { type: "enabled", clear_thinking: false },
+            chat_template_args: { enable_thinking: true },
+          }),
         },
       ])
     }),
