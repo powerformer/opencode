@@ -792,7 +792,7 @@ it.live("session.processor effect tests stop on fabricated role marker before to
             time: parent.time,
             agent: parent.agent,
             model: { providerID: ref.providerID, modelID: ref.modelID },
-          } satisfies MessageV2.User,
+          } satisfies SessionV1.User,
           sessionID: chat.id,
           model: mdl,
           agent: agent(),
