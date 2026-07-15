@@ -5,7 +5,7 @@ This fork tracks upstream OpenCode releases and keeps downstream changes small, 
 ## Upstream baseline
 
 - Baseline: `v1.18.1` (`99f638d8293f6985726ba509da602296c4963497`)
-- Upgrade branch: `codex/align-upstream-v1.18.1`
+- Upgrade branch: `upstream-align`
 - Do not merge the previous downstream `dev` branch into a new upstream baseline. Audit downstream commits and carry only behavior that is still missing upstream.
 
 ## Downstream patch inventory
