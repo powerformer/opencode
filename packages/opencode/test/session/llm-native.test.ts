@@ -418,13 +418,6 @@ describe("session.llm-native.request", () => {
     })
     expect(
       LLMNativeRuntime.status({
-        model: { ...baseModel, providerID: ProviderV2.ID.make("google") },
-        provider: { ...providerInfo, id: ProviderV2.ID.make("google") },
-        auth: undefined,
-      }),
-    ).toEqual({ type: "unsupported", reason: "provider is not openai, opencode, or anthropic" })
-    expect(
-      LLMNativeRuntime.status({
         model: baseModel,
         provider: providerInfo,
         auth: { type: "oauth", refresh: "refresh", access: "access", expires: 1 },
@@ -453,6 +446,35 @@ describe("session.llm-native.request", () => {
         auth: undefined,
       }),
     ).toEqual({ type: "unsupported", reason: "API key is not configured" })
+  })
+
+  test("enables native runtime for custom OpenAI-compatible providers", () => {
+    expect(
+      LLMNativeRuntime.status({
+        model: {
+          ...baseModel,
+          providerID: ProviderV2.ID.make("amr"),
+          api: { ...baseModel.api, npm: "@ai-sdk/openai-compatible" },
+        },
+        provider: { ...providerInfo, id: ProviderV2.ID.make("amr") },
+        auth: undefined,
+      }),
+    ).toMatchObject({
+      type: "supported",
+      apiKey: "test-openai-key",
+    })
+
+    expect(
+      LLMNativeRuntime.status({
+        model: {
+          ...baseModel,
+          providerID: ProviderV2.ID.make("custom-anthropic"),
+          api: { ...baseModel.api, npm: "@ai-sdk/anthropic" },
+        },
+        provider: { ...providerInfo, id: ProviderV2.ID.make("custom-anthropic") },
+        auth: undefined,
+      }),
+    ).toEqual({ type: "unsupported", reason: "custom providers require the OpenAI-compatible package" })
   })
 
   test("enables native runtime for Anthropic API-key models", () => {
@@ -688,6 +710,54 @@ describe("session.llm-native.request", () => {
         include: ["reasoning.encrypted_content"],
         store: false,
       },
+    }),
+  )
+
+  it.effect("preserves OpenAI-compatible interleaved reasoning through native request lowering", () =>
+    Effect.gen(function* () {
+      const prepared = yield* prepareNativeRequest({
+        model: {
+          ...baseModel,
+          id: ModelV2.ID.make("deepseek-reasoner"),
+          providerID: ProviderV2.ID.make("amr"),
+          api: {
+            id: "deepseek-reasoner",
+            url: "https://api.amr.test/v1",
+            npm: "@ai-sdk/openai-compatible",
+          },
+          capabilities: {
+            ...baseModel.capabilities,
+            interleaved: { field: "reasoning_details" },
+          },
+        },
+        apiKey: "test-key",
+        messages: [
+          {
+            role: "assistant",
+            content: [storedSession.text("Done.")],
+            providerOptions: {
+              openaiCompatible: {
+                reasoning_content: "thinking",
+                reasoning_details: "details",
+              },
+            },
+          },
+        ],
+      })
+
+      expect(prepared).toMatchObject({
+        route: "openai-compatible-chat",
+        body: {
+          messages: [
+            {
+              role: "assistant",
+              content: "Done.",
+              reasoning_content: "thinking",
+              reasoning_details: "details",
+            },
+          ],
+        },
+      })
     }),
   )
 
