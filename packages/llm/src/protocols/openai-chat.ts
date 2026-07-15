@@ -75,6 +75,7 @@ const OpenAIChatMessage = Schema.Union([
     content: Schema.NullOr(Schema.String),
     tool_calls: optionalArray(OpenAIChatAssistantToolCall),
     reasoning_content: Schema.optional(Schema.String),
+    reasoning_details: Schema.optional(Schema.String),
   }),
   Schema.Struct({ role: Schema.Literal("tool"), tool_call_id: Schema.String, content: Schema.String }),
 ]).pipe(Schema.toTaggedUnion("role"))
@@ -97,6 +98,9 @@ export const bodyFields = {
   stream_options: Schema.optional(Schema.Struct({ include_usage: Schema.Boolean })),
   store: Schema.optional(Schema.Boolean),
   reasoning_effort: Schema.optional(OpenAIOptions.OpenAIReasoningEffort),
+  enable_thinking: Schema.optional(Schema.Boolean),
+  thinking: Schema.optional(JsonObject),
+  chat_template_args: Schema.optional(JsonObject),
   max_tokens: Schema.optional(Schema.Number),
   temperature: Schema.optional(Schema.Number),
   top_p: Schema.optional(Schema.Number),
@@ -145,6 +149,7 @@ type OpenAIChatToolCallDelta = Schema.Schema.Type<typeof OpenAIChatToolCallDelta
 const OpenAIChatDelta = Schema.Struct({
   content: optionalNull(Schema.String),
   reasoning_content: optionalNull(Schema.String),
+  reasoning_details: optionalNull(Schema.String),
   tool_calls: optionalNull(Schema.Array(OpenAIChatToolCallDelta)),
 })
 
@@ -210,6 +215,9 @@ const lowerMedia = Effect.fn("OpenAIChat.lowerMedia")(function* (part: MediaPart
 const openAICompatibleReasoningContent = (native: unknown) =>
   isRecord(native) && typeof native.reasoning_content === "string" ? native.reasoning_content : undefined
 
+const openAICompatibleReasoningDetails = (native: unknown) =>
+  isRecord(native) && typeof native.reasoning_details === "string" ? native.reasoning_details : undefined
+
 const lowerUserMessage = Effect.fn("OpenAIChat.lowerUserMessage")(function* (message: OpenAIChatRequestMessage) {
   const content: Array<Schema.Schema.Type<typeof OpenAIChatUserContent>> = []
   for (const part of message.content) {
@@ -258,6 +266,7 @@ const lowerAssistantMessage = Effect.fn("OpenAIChat.lowerAssistantMessage")(func
       reasoning.length > 0
         ? reasoning.map((part) => part.text).join("")
         : openAICompatibleReasoningContent(message.native?.openaiCompatible),
+    reasoning_details: openAICompatibleReasoningDetails(message.native?.openaiCompatible),
   }
 })
 
@@ -333,11 +342,17 @@ const lowerMessages = Effect.fn("OpenAIChat.lowerMessages")(function* (request: 
 const lowerOptions = Effect.fn("OpenAIChat.lowerOptions")(function* (request: LLMRequest) {
   const store = OpenAIOptions.store(request)
   const reasoningEffort = OpenAIOptions.reasoningEffort(request)
+  const options = request.providerOptions?.openai
   if (reasoningEffort && !OpenAIOptions.isReasoningEffort(reasoningEffort))
     return yield* invalid(`OpenAI Chat does not support reasoning effort ${reasoningEffort}`)
   return {
     ...(store !== undefined ? { store } : {}),
     ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+    ...(isRecord(options) && typeof options.enable_thinking === "boolean"
+      ? { enable_thinking: options.enable_thinking }
+      : {}),
+    ...(isRecord(options?.thinking) ? { thinking: options.thinking } : {}),
+    ...(isRecord(options?.chat_template_args) ? { chat_template_args: options.chat_template_args } : {}),
   }
 })
 
@@ -416,8 +431,8 @@ const step = (state: ParserState, event: OpenAIChatEvent) =>
 
     let lifecycle = state.lifecycle
 
-    if (delta?.reasoning_content)
-      lifecycle = Lifecycle.reasoningDelta(lifecycle, events, "reasoning-0", delta.reasoning_content)
+    const reasoning = delta?.reasoning_content ?? delta?.reasoning_details
+    if (reasoning) lifecycle = Lifecycle.reasoningDelta(lifecycle, events, "reasoning-0", reasoning)
 
     if (delta?.content) {
       lifecycle = Lifecycle.reasoningEnd(lifecycle, events, "reasoning-0")

@@ -52,9 +52,14 @@ function statusWithFetch(
   fetch: typeof globalThis.fetch | undefined,
 ): RuntimeStatus {
   const providerID = input.model.providerID
-  if (providerID !== "openai" && providerID !== "anthropic" && !providerID.startsWith("opencode"))
-    return { type: "unsupported", reason: "provider is not openai, opencode, or anthropic" }
   const npm = input.model.api.npm
+  if (
+    npm !== "@ai-sdk/openai-compatible" &&
+    providerID !== "openai" &&
+    providerID !== "anthropic" &&
+    !providerID.startsWith("opencode")
+  )
+    return { type: "unsupported", reason: "custom providers require the OpenAI-compatible package" }
   if (npm !== "@ai-sdk/openai" && npm !== "@ai-sdk/openai-compatible" && npm !== "@ai-sdk/anthropic")
     return { type: "unsupported", reason: "provider package is not OpenAI, OpenAI-compatible, or Anthropic" }
   if (input.auth?.type === "oauth" && !(input.provider.id === "openai" && fetch)) {
@@ -87,6 +92,7 @@ export function stream(input: StreamInput): StreamResult {
   // — if a field ever needs to differ between the two surfaces, the
   // translation belongs here, not split across both packages.
   const tools = nativeTools(input.tools, input)
+  const providerOptions = ProviderTransform.providerOptions(input.model, input.providerOptions ?? {})
   const request = LLMNative.request({
     model: input.model,
     apiKey: current.apiKey,
@@ -97,7 +103,10 @@ export function stream(input: StreamInput): StreamResult {
     topP: input.topP,
     topK: input.topK,
     maxOutputTokens: input.maxOutputTokens,
-    providerOptions: ProviderTransform.providerOptions(input.model, input.providerOptions ?? {}),
+    providerOptions:
+      input.model.api.npm === "@ai-sdk/openai-compatible"
+        ? { openai: providerOptions[input.model.providerID.split(".")[0]] ?? {} }
+        : providerOptions,
     headers: { ...providerHeaders(input.provider.options.headers), ...input.headers },
   })
   const stream = Stream.scoped(
@@ -146,7 +155,6 @@ export function stream(input: StreamInput): StreamResult {
 }
 
 function providerFetch(input: Pick<StreamInput, "provider" | "auth">): typeof globalThis.fetch | undefined {
-  if (input.provider.id !== "openai" || input.auth?.type !== "oauth") return undefined
   const value: unknown = input.provider.options.fetch
   if (typeof value !== "function") return undefined
   return value as typeof globalThis.fetch
