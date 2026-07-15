@@ -828,4 +828,52 @@ describe("session.llm-native.request", () => {
       )
     }),
   )
+
+  it.effect("normalizes custom OpenAI-compatible options for native requests", () =>
+    Effect.gen(function* () {
+      const captures: Array<{ url: string; body: unknown }> = []
+      const customFetch = Object.assign(
+        async (input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]) => {
+          const request = input instanceof Request ? input : new Request(input, init)
+          captures.push({ url: request.url, body: await request.clone().json() })
+          return responsesStream([
+            { choices: [{ delta: { content: "Hello" } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }] },
+          ])
+        },
+        { preconnect: () => undefined },
+      ) satisfies typeof fetch
+
+      const llmClient = yield* LLMClient.Service
+      const native = LLMNativeRuntime.stream({
+        model: {
+          ...baseModel,
+          providerID: ProviderV2.ID.make("amr"),
+          api: { id: "deepseek-reasoner", url: "https://api.amr.test/v1", npm: "@ai-sdk/openai-compatible" },
+        },
+        provider: {
+          ...providerInfo,
+          id: ProviderV2.ID.make("amr"),
+          options: { apiKey: "test-key", fetch: customFetch },
+        },
+        auth: undefined,
+        llmClient,
+        messages: [{ role: "user", content: "hello" }],
+        tools: {},
+        providerOptions: { reasoningEffort: "high" },
+        headers: {},
+        abort: new AbortController().signal,
+      })
+      expect(native.type).toBe("supported")
+      if (native.type === "unsupported") throw new Error(native.reason)
+      yield* native.stream.pipe(Stream.runCollect)
+
+      expect(captures).toEqual([
+        {
+          url: "https://api.amr.test/v1/chat/completions",
+          body: expect.objectContaining({ model: "deepseek-reasoner", reasoning_effort: "high" }),
+        },
+      ])
+    }),
+  )
 })
