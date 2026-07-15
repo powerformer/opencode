@@ -1,5 +1,5 @@
-const ROLE_MARKER_RE = /(^|\n)(## (?:user|assistant|assist|system)(?=[\n:：]))/u
-const ROLE_MARKER_END_RE = /(^|\n)(## (?:user|assistant|assist|system))$/u
+const ROLE_MARKER_RE = /(^|\n)(## (?:user|assistant|assist|system))(?=(?:[ \t]*\r?\n)|[:：])/u
+const ROLE_MARKER_END_RE = /(^|\n)(## (?:user|assistant|assist|system))(?:[ \t]*\r?)$/u
 const MARKERS = ["## user", "## assistant", "## assist", "## system"]
 
 export type RoleMarkerDetection = {
@@ -20,15 +20,14 @@ export function createRoleMarkerGuard() {
   }
 
   function splitPending(value: string) {
-    for (let index = Math.max(0, value.length - "## assistant".length); index < value.length; index++) {
-      if (index > 0 && value[index - 1] !== "\n") continue
-      const suffix = value.slice(index)
-      if (!MARKERS.some((marker) => marker.startsWith(suffix))) continue
-      return {
-        text: value.slice(0, index),
-        pending: suffix,
-      }
-    }
+    const index = value.lastIndexOf("\n") + 1
+    const suffix = value.slice(index)
+    const pending = MARKERS.some(
+      (marker) =>
+        marker.startsWith(suffix) ||
+        (suffix.startsWith(marker) && /^[ \t]*\r?$/u.test(suffix.slice(marker.length))),
+    )
+    if (pending) return { text: value.slice(0, index), pending: suffix }
     return {
       text: value,
       pending: "",

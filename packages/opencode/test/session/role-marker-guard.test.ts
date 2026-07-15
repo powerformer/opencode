@@ -22,6 +22,33 @@ describe("role marker guard", () => {
     expect(result.detection?.marker).toBe("## user")
   })
 
+  test("detects markers followed by CRLF", () => {
+    const guard = createRoleMarkerGuard()
+    const result = guard.feed("safe\r\n## user\r\ninjected")
+
+    expect(result.text).toBe("safe\r\n")
+    expect(result.detection?.marker).toBe("## user")
+  })
+
+  test("detects markers with trailing whitespace before CRLF", () => {
+    const guard = createRoleMarkerGuard()
+    const result = guard.feed("safe\n## assistant \t\r\ninjected")
+
+    expect(result.text).toBe("safe\n")
+    expect(result.detection?.marker).toBe("## assistant")
+  })
+
+  test("detects CRLF boundaries split across chunks", () => {
+    const guard = createRoleMarkerGuard()
+
+    expect(guard.feed("safe\n## system ")).toEqual({ text: "safe\n" })
+    expect(guard.feed("\r")).toEqual({ text: "" })
+    const result = guard.feed("\ninjected")
+
+    expect(result.text).toBe("")
+    expect(result.detection?.marker).toBe("## system")
+  })
+
   test("waits for a boundary before detecting a complete marker at chunk end", () => {
     const guard = createRoleMarkerGuard()
 
