@@ -226,6 +226,46 @@ const fragmentFailureLLM = Layer.succeed(
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
+const retryFragmentLLM = Layer.sync(LLM.Service, () => {
+  let attempt = 0
+  return LLM.Service.of({
+    stream: () => {
+      attempt++
+      if (attempt === 1) {
+        return Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.reasoningStart({ id: "reasoning-failed" }),
+          LLMEvent.reasoningDelta({ id: "reasoning-failed", text: "discarded thinking" }),
+          LLMEvent.textStart({ id: "text-failed" }),
+          LLMEvent.textDelta({ id: "text-failed", text: "discarded text" }),
+          LLMEvent.toolInputStart({ id: "tool-failed", name: "lookup" }),
+          LLMEvent.toolInputEnd({ id: "tool-failed", name: "lookup" }),
+          LLMEvent.toolCall({ id: "tool-failed", name: "lookup", input: { query: "discarded" } }),
+          LLMEvent.toolResult({
+            id: "tool-failed",
+            name: "lookup",
+            result: { type: "json", value: { output: "discarded result" } },
+          }),
+          LLMEvent.providerError({ message: "rate limit" }),
+        )
+      }
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.reasoningStart({ id: "reasoning-success" }),
+        LLMEvent.reasoningDelta({ id: "reasoning-success", text: "committed thinking" }),
+        LLMEvent.reasoningEnd({ id: "reasoning-success" }),
+        LLMEvent.textStart({ id: "text-success" }),
+        LLMEvent.textDelta({ id: "text-success", text: "committed text" }),
+        LLMEvent.textEnd({ id: "text-success" }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+    },
+  })
+})
+const retryFragmentEnv = LayerNode.compile(root, [...replacements, [LLM.node, retryFragmentLLM]])
+const itRetryFragment = testEffect(retryFragmentEnv)
+
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
   const session = yield* Session.Service
@@ -514,6 +554,58 @@ it.live("session.processor effect tests reset reasoning state across retries", (
   ),
 )
 
+itRetryFragment.live("session.processor discards failed attempt parts before committing a retry", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry fragments")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        expect(
+          yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "retry fragments" }],
+            tools: {},
+          }),
+        ).toBe("continue")
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const modelMessages = yield* MessageV2.toModelMessagesEffect([{ info: msg, parts }], mdl).pipe(
+          Effect.provideService(Database.Service, database),
+        )
+        const serialized = JSON.stringify(modelMessages)
+
+        expect(serialized).toContain("committed thinking")
+        expect(serialized).toContain("committed text")
+        expect(serialized).not.toContain("discarded thinking")
+        expect(serialized).not.toContain("discarded text")
+        expect(serialized).not.toContain("discarded result")
+        expect(parts.filter((part) => part.type === "reasoning")).toHaveLength(1)
+        expect(parts.filter((part) => part.type === "text")).toHaveLength(1)
+        expect(parts.filter((part) => part.type === "tool")).toHaveLength(0)
+        expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
+      }),
+    { config: cfg },
+  ),
+)
+
 it.live("session.processor effect tests do not retry unknown json errors", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
@@ -751,6 +843,12 @@ it.live(
           expect(value).toBe("stop")
           expect(yield* llm.calls).toBe(3)
           expect(handle.message.error?.name).toBe("APIError")
+          if (!SessionV1.APIError.isInstance(handle.message.error)) throw new Error("expected APIError")
+          expect(handle.message.error.data.metadata).toMatchObject({
+            retryExhausted: "true",
+            retryAttempts: "2",
+            totalAttempts: "3",
+          })
         }),
       { config: (url) => providerCfg(url) },
     ),
