@@ -28,7 +28,7 @@ export const RETRY_BACKOFF_FACTOR = 2
 export const RETRY_JITTER_FACTOR = 0.25
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
-export const RETRY_MAX_RETRIES = 5
+export const RETRY_MAX_RETRIES = 2
 
 const RETRYABLE_MESSAGE_PATTERNS = [
   /429|500|502|503|504|524/i,
@@ -44,42 +44,33 @@ function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
 }
 
-export function delay(attempt: number, error?: SessionV1.APIError, random = Math.random()) {
-  if (error) {
-    const headers = error.data.responseHeaders
-    if (headers) {
-      const retryAfterMs = headers["retry-after-ms"]
-      if (retryAfterMs) {
-        const parsedMs = Number.parseFloat(retryAfterMs)
-        if (!Number.isNaN(parsedMs)) {
-          return cap(parsedMs)
-        }
-      }
-
-      const retryAfter = headers["retry-after"]
-      if (retryAfter) {
-        const parsedSeconds = Number.parseFloat(retryAfter)
-        if (!Number.isNaN(parsedSeconds)) {
-          // convert seconds to milliseconds
-          return cap(Math.ceil(parsedSeconds * 1000))
-        }
-        // Try parsing as HTTP date format
-        const parsed = Date.parse(retryAfter) - Date.now()
-        if (!Number.isNaN(parsed) && parsed > 0) {
-          return cap(Math.ceil(parsed))
-        }
-      }
-
-      return cap(exponential(attempt, random))
-    }
+function hint(error?: SessionV1.APIError) {
+  const headers = error?.data.responseHeaders
+  if (!headers) return undefined
+  const retryAfterMs = headers["retry-after-ms"]
+  if (retryAfterMs) {
+    const parsedMs = Number.parseFloat(retryAfterMs)
+    if (!Number.isNaN(parsedMs)) return cap(parsedMs)
   }
 
-  return cap(Math.min(exponential(attempt, random), RETRY_MAX_DELAY_NO_HEADERS))
+  const retryAfter = headers["retry-after"]
+  if (!retryAfter) return undefined
+  const parsedSeconds = Number.parseFloat(retryAfter)
+  if (!Number.isNaN(parsedSeconds)) return cap(Math.ceil(parsedSeconds * 1000))
+  const parsed = Date.parse(retryAfter) - Date.now()
+  if (!Number.isNaN(parsed) && parsed > 0) return cap(Math.ceil(parsed))
+  return undefined
 }
 
-function exponential(attempt: number, random: number) {
-  const base = RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1)
-  return Math.ceil(base + base * RETRY_JITTER_FACTOR * random)
+export function delay(attempt: number, error?: SessionV1.APIError, random = Math.random()) {
+  const exact = hint(error)
+  if (exact !== undefined) return exact
+  return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1) * (1 + RETRY_JITTER_FACTOR * random), RETRY_MAX_DELAY_NO_HEADERS))
+}
+
+function jitter(ms: number) {
+  const half = Math.floor(ms / 2)
+  return half + Math.floor(Math.random() * (ms - half))
 }
 
 export function retryable(error: Err, provider: string) {
@@ -87,15 +78,11 @@ export function retryable(error: Err, provider: string) {
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
   if (SessionV1.APIError.isInstance(error)) {
     const status = error.data.statusCode
-    // 5xx errors are transient server failures and should always be retried,
-    // even when the provider SDK doesn't explicitly mark them as retryable.
-    if (
-      !error.data.isRetryable &&
-      !(status !== undefined && status >= 500) &&
-      !matchesRetryableMessage(error.data.message) &&
-      !matchesRetryableMessage(error.data.responseBody)
-    )
-      return undefined
+    const transient =
+      status === undefined
+        ? error.data.isRetryable || matchesRetryableMessage(error.data.message) || matchesRetryableMessage(error.data.responseBody)
+        : status === 408 || status === 429 || status >= 500 || (status === 404 && error.data.isRetryable)
+    if (!transient) return undefined
     if (error.data.responseBody?.includes("FreeUsageLimitError")) {
       return {
         message: GO_UPSELL_MESSAGE,
@@ -189,10 +176,10 @@ export function policy(opts: {
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
       const error = opts.parse(meta.input)
       const retry = retryable(error, opts.provider)
-      if (!retry) return Cause.done(meta.attempt)
-      if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
+      if (!retry || meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
-        const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
+        const api = SessionV1.APIError.isInstance(error) ? error : undefined
+        const wait = hint(api) ?? jitter(delay(meta.attempt, undefined, 0))
         const now = yield* Clock.currentTimeMillis
         yield* opts.set({
           attempt: meta.attempt,

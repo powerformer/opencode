@@ -708,6 +708,55 @@ it.live("session.processor effect tests retry network_error finish reasons", () 
   ),
 )
 
+it.live(
+  "session.processor effect tests stop after two retries",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          yield* llm.error(503, { error: "one" })
+          yield* llm.error(503, { error: "two" })
+          yield* llm.error(503, { error: "three" })
+          yield* llm.text("unexpected")
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "bounded retry")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "bounded retry" }],
+            tools: {},
+          })
+
+          expect(value).toBe("stop")
+          expect(yield* llm.calls).toBe(3)
+          expect(handle.message.error?.name).toBe("APIError")
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  10_000,
+)
+
 it.live("session.processor effect tests publish retry status updates", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>

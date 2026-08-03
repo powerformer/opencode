@@ -39,6 +39,10 @@ describe("session.retry.delay", () => {
     expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000, 30000])
   })
 
+  test("caps delay with unrelated response headers", () => {
+    expect(SessionRetry.delay(10, apiError({ "content-type": "text/event-stream" }), 0)).toBe(30000)
+  })
+
   test("adds jitter to exponential delays", () => {
     const error = apiError()
     expect(SessionRetry.delay(1, error, 0)).toBe(2000)
@@ -124,7 +128,7 @@ describe("session.retry.delay", () => {
     }),
   )
 
-  it.instance("policy stops after five retries", () =>
+  it.instance("policy stops after two retries", () =>
     Effect.gen(function* () {
       const attempts: number[] = []
       const error = apiError({ "retry-after-ms": "0" })
@@ -143,7 +147,7 @@ describe("session.retry.delay", () => {
         Effect.ignore(step(error)),
       )
 
-      expect(attempts).toStrictEqual([1, 2, 3, 4, 5])
+      expect(attempts).toStrictEqual([1, 2])
     }),
   )
 })
@@ -232,7 +236,7 @@ describe("session.retry.retryable", () => {
     })
   })
 
-  test("matches retryable API response bodies", () => {
+  test("does not retry ordinary 400 responses even with transient error text", () => {
     const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
       new SessionV1.APIError({
         message: "Request failed",
@@ -241,7 +245,7 @@ describe("session.retry.retryable", () => {
         responseBody: JSON.stringify({ error: { message: "upstream connection refused" } }),
       }).toObject(),
     )
-    expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Request failed" })
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
   })
 
   test("retries transport timeout errors", () => {
