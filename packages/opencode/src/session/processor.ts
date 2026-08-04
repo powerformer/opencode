@@ -72,6 +72,7 @@ interface ProcessorContext extends Input {
   needsCompaction: boolean
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
+  retryAttempts: number
 }
 
 type StreamEvent = LLMEvent
@@ -111,6 +112,7 @@ const layer = Layer.effect(
         needsCompaction: false,
         currentText: undefined,
         reasoningMap: {},
+        retryAttempts: 0,
       }
       let aborted = false
 
@@ -119,6 +121,24 @@ const layer = Layer.effect(
           providerID: input.model.providerID,
           aborted,
         })
+
+      const terminalError = (e: unknown) => {
+        const error = parse(e)
+        const retry = SessionRetry.retryable(error, input.model.providerID)
+        if (!retry || ctx.retryAttempts < SessionRetry.RETRY_MAX_RETRIES) return error
+        // Keep the provider error shape while making local policy exhaustion
+        // durable for CLI/runtime consumers that must not start another retry layer.
+        const data = SessionV1.APIError.isInstance(error) ? error.data : { message: retry.message, isRetryable: true }
+        return new SessionV1.APIError({
+          ...data,
+          metadata: {
+            ...data.metadata,
+            retryExhausted: "true",
+            retryAttempts: String(ctx.retryAttempts),
+            totalAttempts: String(ctx.retryAttempts + 1),
+          },
+        }).toObject()
+      }
 
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
         const done = ctx.toolcalls[toolCallID]?.done
@@ -603,7 +623,7 @@ const layer = Layer.effect(
           error: errorMessage(e),
           stack: e instanceof Error ? e.stack : undefined,
         })
-        const error = parse(e)
+        const error = terminalError(e)
         if (SessionV1.ContextOverflowError.isInstance(error)) {
           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
             ctx.assistantMessage.error = error
@@ -630,7 +650,49 @@ const layer = Layer.effect(
           messageID: input.assistantMessage.id,
         })
         ctx.needsCompaction = false
+        ctx.retryAttempts = 0
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+
+        const attemptPartIDs = new Set(
+          (yield* MessageV2.parts(ctx.assistantMessage.id).pipe(Effect.provideService(Database.Service, database))).map(
+            (part) => part.id,
+          ),
+        )
+        const attemptMessage = structuredClone(ctx.assistantMessage)
+        const attemptSnapshot = ctx.snapshot
+
+        const rollbackAttempt = Effect.fnUntraced(function* () {
+          // Stream parts are persisted for live UI updates. A retry must remove
+          // only this attempt's additions before the next attempt can commit.
+          yield* Effect.forEach(Object.keys(ctx.toolcalls), settleToolCall)
+          ctx.currentText = undefined
+          ctx.reasoningMap = {}
+          ctx.toolcalls = {}
+          ctx.blocked = false
+          ctx.needsCompaction = false
+
+          const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
+            Effect.provideService(Database.Service, database),
+          )
+          yield* Effect.forEach(
+            parts.filter((part) => !attemptPartIDs.has(part.id)),
+            (part) =>
+              session.removePart({
+                sessionID: part.sessionID,
+                messageID: part.messageID,
+                partID: part.id,
+              }),
+          )
+          if (attemptSnapshot) yield* snapshot.restore(attemptSnapshot)
+          ctx.snapshot = attemptSnapshot
+          ctx.assistantMessage.time = structuredClone(attemptMessage.time)
+          ctx.assistantMessage.error = attemptMessage.error
+          ctx.assistantMessage.cost = attemptMessage.cost
+          ctx.assistantMessage.tokens = structuredClone(attemptMessage.tokens)
+          ctx.assistantMessage.structured = attemptMessage.structured
+          ctx.assistantMessage.finish = attemptMessage.finish
+          yield* session.updateMessage(ctx.assistantMessage)
+        })
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
@@ -662,12 +724,16 @@ const layer = Layer.effect(
                 provider: input.model.providerID,
                 parse,
                 set: (info) => {
-                  return status.set(ctx.sessionID, {
-                    type: "retry",
-                    attempt: info.attempt,
-                    message: info.message,
-                    action: info.action,
-                    next: info.next,
+                  return Effect.gen(function* () {
+                    yield* rollbackAttempt()
+                    ctx.retryAttempts = info.attempt
+                    yield* status.set(ctx.sessionID, {
+                      type: "retry",
+                      attempt: info.attempt,
+                      message: info.message,
+                      action: info.action,
+                      next: info.next,
+                    })
                   })
                 },
               }),
