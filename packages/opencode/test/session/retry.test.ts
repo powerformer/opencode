@@ -4,7 +4,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
-import { Effect, Schedule, Schema } from "effect"
+import { Duration, Effect, Pull, Schedule, Schema } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -37,6 +37,11 @@ describe("session.retry.delay", () => {
     const error = apiError()
     const delays = Array.from({ length: 10 }, (_, index) => SessionRetry.delay(index + 1, error))
     expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000, 30000])
+  })
+
+  test("caps delay at 30 seconds when retry headers are missing", () => {
+    const error = apiError({ "content-type": "text/event-stream" })
+    expect(SessionRetry.delay(10, error)).toBe(SessionRetry.RETRY_MAX_DELAY_NO_HEADERS)
   })
 
   test("prefers retry-after-ms when shorter than exponential", () => {
@@ -113,6 +118,42 @@ describe("session.retry.delay", () => {
         attempt: 2,
         message: "boom",
       })
+    }),
+  )
+
+  it.instance("policy stops after two retries", () =>
+    Effect.gen(function* () {
+      const error = apiError({ "retry-after-ms": "0" })
+      const step = yield* Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          provider: "test",
+          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          set: () => Effect.void,
+        }),
+      )
+
+      yield* step(error)
+      yield* step(error)
+      const result = yield* step(error).pipe(Pull.catchDone((attempt) => Effect.succeed({ done: attempt })))
+
+      expect(result).toEqual({ done: 3 })
+    }),
+  )
+
+  it.instance("policy jitters provider-unspecified backoff", () =>
+    Effect.gen(function* () {
+      const error = apiError()
+      const step = yield* Schedule.toStep(
+        SessionRetry.policy({
+          provider: "test",
+          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          set: () => Effect.void,
+        }),
+      )
+
+      const result = yield* step(0, error)
+      expect(Duration.toMillis(result[1])).toBeGreaterThanOrEqual(1000)
+      expect(Duration.toMillis(result[1])).toBeLessThan(2000)
     }),
   )
 })
@@ -238,6 +279,45 @@ describe("session.retry.retryable", () => {
     )
 
     expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
+  test.each([400, 401, 403, 413, 422, 499])(
+    "does not retry deterministic %d errors marked retryable by a provider",
+    (statusCode) => {
+      const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+        new SessionV1.APIError({
+          message: "Client error",
+          isRetryable: true,
+          statusCode,
+        }).toObject(),
+      )
+
+      expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+    },
+  )
+
+  test.each([408, 429])("retries transient %d errors even when a provider marks them non-retryable", (statusCode) => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Transient client error",
+        isRetryable: false,
+        statusCode,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Transient client error" })
+  })
+
+  test("retries provider-approved 404 errors", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Model temporarily not found",
+        isRetryable: true,
+        statusCode: 404,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Model temporarily not found" })
   })
 
   test("retries ZlibError decompression failures", () => {

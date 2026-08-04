@@ -25,6 +25,7 @@ export type Retryable = {
 
 export const RETRY_INITIAL_DELAY = 2000
 export const RETRY_BACKOFF_FACTOR = 2
+export const RETRY_MAX_RETRIES = 2
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 
@@ -32,37 +33,33 @@ function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
 }
 
-export function delay(attempt: number, error?: SessionV1.APIError) {
-  if (error) {
-    const headers = error.data.responseHeaders
-    if (headers) {
-      const retryAfterMs = headers["retry-after-ms"]
-      if (retryAfterMs) {
-        const parsedMs = Number.parseFloat(retryAfterMs)
-        if (!Number.isNaN(parsedMs)) {
-          return cap(parsedMs)
-        }
-      }
-
-      const retryAfter = headers["retry-after"]
-      if (retryAfter) {
-        const parsedSeconds = Number.parseFloat(retryAfter)
-        if (!Number.isNaN(parsedSeconds)) {
-          // convert seconds to milliseconds
-          return cap(Math.ceil(parsedSeconds * 1000))
-        }
-        // Try parsing as HTTP date format
-        const parsed = Date.parse(retryAfter) - Date.now()
-        if (!Number.isNaN(parsed) && parsed > 0) {
-          return cap(Math.ceil(parsed))
-        }
-      }
-
-      return cap(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1))
-    }
+function hint(error?: SessionV1.APIError) {
+  const headers = error?.data.responseHeaders
+  if (!headers) return undefined
+  const retryAfterMs = headers["retry-after-ms"]
+  if (retryAfterMs) {
+    const parsedMs = Number.parseFloat(retryAfterMs)
+    if (!Number.isNaN(parsedMs)) return cap(parsedMs)
   }
 
+  const retryAfter = headers["retry-after"]
+  if (!retryAfter) return undefined
+  const parsedSeconds = Number.parseFloat(retryAfter)
+  if (!Number.isNaN(parsedSeconds)) return cap(Math.ceil(parsedSeconds * 1000))
+  const parsed = Date.parse(retryAfter) - Date.now()
+  if (!Number.isNaN(parsed) && parsed > 0) return cap(Math.ceil(parsed))
+  return undefined
+}
+
+export function delay(attempt: number, error?: SessionV1.APIError) {
+  const exact = hint(error)
+  if (exact !== undefined) return exact
   return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
+}
+
+function jitter(ms: number) {
+  const half = Math.floor(ms / 2)
+  return half + Math.floor(Math.random() * (ms - half))
 }
 
 export function retryable(error: Err, provider: string) {
@@ -70,9 +67,11 @@ export function retryable(error: Err, provider: string) {
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
   if (SessionV1.APIError.isInstance(error)) {
     const status = error.data.statusCode
-    // 5xx errors are transient server failures and should always be retried,
-    // even when the provider SDK doesn't explicitly mark them as retryable.
-    if (!error.data.isRetryable && !(status !== undefined && status >= 500)) return undefined
+    const transient =
+      status === undefined
+        ? error.data.isRetryable
+        : status === 408 || status === 429 || status >= 500 || (status === 404 && error.data.isRetryable)
+    if (!transient) return undefined
     if (error.data.responseBody?.includes("FreeUsageLimitError")) {
       return {
         message: GO_UPSELL_MESSAGE,
@@ -182,9 +181,10 @@ export function policy(opts: {
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
       const error = opts.parse(meta.input)
       const retry = retryable(error, opts.provider)
-      if (!retry) return Cause.done(meta.attempt)
+      if (!retry || meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
-        const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
+        const api = SessionV1.APIError.isInstance(error) ? error : undefined
+        const wait = hint(api) ?? jitter(delay(meta.attempt))
         const now = yield* Clock.currentTimeMillis
         yield* opts.set({
           attempt: meta.attempt,
