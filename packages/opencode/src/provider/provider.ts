@@ -31,6 +31,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ModelStatus } from "./model-status"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderError } from "./error"
+import { RequestSize } from "./request-size"
 
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 10_000
 
@@ -1163,6 +1164,7 @@ interface State {
   sdk: Map<string, BundledSDK>
   modelLoaders: Record<string, CustomModelLoader>
   varsLoaders: Record<string, CustomVarsLoader>
+  report: (model: Model, sessionID: string | undefined, metrics: RequestSize.Metrics) => Promise<unknown>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Provider") {}
@@ -1657,6 +1659,15 @@ const layer = Layer.effect(
           sdk,
           modelLoaders,
           varsLoaders,
+          report: (model, sessionID, metrics) =>
+            bridge.promise(
+              Effect.logInfo("provider request size", {
+                providerID: model.providerID,
+                modelID: model.id,
+                ...(sessionID ? { "session.id": sessionID } : {}),
+                request: metrics,
+              }),
+            ),
         }
       }),
     )
@@ -1750,11 +1761,18 @@ const layer = Layer.effect(
           const combined = signals.length === 0 ? null : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
           if (combined) opts.signal = combined
 
-          const res = await fetchFn(input, {
-            ...opts,
-            // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
-            timeout: false,
-          }).finally(() => headerTimeoutCtl?.clear())
+          const headers = new Headers(opts.headers)
+          const sessionID = headers.get("x-opencode-session") ?? headers.get("x-session-id") ?? undefined
+          const res = await RequestSize.send<Response>(
+            opts.body,
+            (metrics) => s.report(model, sessionID, metrics),
+            () =>
+              fetchFn(input, {
+                ...opts,
+                // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
+                timeout: false,
+              }),
+          ).finally(() => headerTimeoutCtl?.clear())
 
           if (!chunkAbortCtl) return res
           return wrapSSE(res, chunkTimeout, chunkAbortCtl)
