@@ -26,6 +26,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent } from "@opencode-ai/llm"
+import { errorToolUpdate } from "@/acp/tool"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -1009,7 +1010,14 @@ it.live("session.processor effect tests complete AI SDK tool calls when native f
         expect(call.state.input).toEqual({ query: "weather" })
         expect(call.state.output).toBe("result:weather")
         expect(call.state.title).toBe("Weather lookup")
-        expect(call.state.metadata).toEqual({ source: "test" })
+        expect(call.state.metadata).toMatchObject({
+          source: "test",
+          toolTerminal: {
+            source: "tool_result",
+            confirmed: true,
+            at_ms: expect.any(Number),
+          },
+        })
         expect(call.state.time.start).toBeDefined()
         expect(call.state.time.end).toBeDefined()
       }),
@@ -1078,7 +1086,19 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
         if (call?.state.status === "error") {
           expect(call.state.error).toBe("Tool execution aborted")
           expect(call.state.metadata?.interrupted).toBe(true)
+          expect(call.state.metadata?.toolTerminal).toMatchObject({
+            source: "processor_cleanup",
+            confirmed: false,
+          })
           expect(call.state.time.end).toBeDefined()
+          expect(
+            errorToolUpdate({ toolCallId: call.callID, toolName: call.tool, state: call.state }).rawOutput,
+          ).toMatchObject({ metadata: { toolTerminal: { source: "processor_cleanup", confirmed: false } } })
+          // A late result cannot retroactively confirm a cleanup-only terminal.
+          yield* handle.completeToolCall(call.callID, { title: "late", output: "late", metadata: {} })
+          yield* handle.completeToolCall(call.callID, { title: "duplicate", output: "duplicate", metadata: {} })
+          const after = yield* MessageV2.parts(msg.id)
+          expect(after.find((part) => part.id === call.id)).toEqual(call)
         }
       }),
     { config: (url) => providerCfg(url) },

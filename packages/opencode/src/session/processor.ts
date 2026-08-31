@@ -1,3 +1,4 @@
+import { ProcessDiagnostics } from "@opencode-ai/core/process-diagnostics"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
@@ -194,7 +195,10 @@ const layer = Layer.effect(
             status: "completed",
             input: match.part.state.input,
             output: output.output,
-            metadata: output.metadata,
+            metadata: {
+              ...output.metadata,
+              toolTerminal: { source: "tool_result", confirmed: true, at_ms: Date.now() },
+            },
             title: output.title,
             time: { start: match.part.state.time.start, end: Date.now() },
             attachments: output.attachments,
@@ -213,7 +217,15 @@ const layer = Layer.effect(
             input: match.part.state.input,
             error: errorMessage(error),
             // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
-            metadata: match.part.state.metadata,
+            metadata: {
+              ...match.part.state.metadata,
+              toolTerminal: {
+                source: "tool_error",
+                confirmed: true,
+                at_ms: Date.now(),
+                error: ProcessDiagnostics.errorChain(error),
+              },
+            },
             time: { start: match.part.state.time.start, end: Date.now() },
           },
         })
@@ -620,7 +632,11 @@ const layer = Layer.effect(
               ...part.state,
               status: "error",
               error: "Tool execution aborted",
-              metadata: { ...metadata, interrupted: true },
+              metadata: {
+                ...metadata,
+                interrupted: true,
+                toolTerminal: { source: "processor_cleanup", confirmed: false, at_ms: end },
+              },
               time: { start: "time" in part.state ? part.state.time.start : end, end },
             },
           })

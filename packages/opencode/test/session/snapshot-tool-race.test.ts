@@ -173,6 +173,10 @@ it.live("tool execution produces non-empty session diff (snapshot race)", () =>
         .flatMap((m) => m.parts)
         .find((p): p is SessionV1.ToolPart => p.type === "tool" && p.tool === "bash")
       expect(tool?.state.status).toBe("completed")
+      if (tool?.state.status === "completed") {
+        // Progress and terminal diagnostics must not reset the execution start.
+        expect(tool.state.time.start).toBeLessThanOrEqual(tool.state.metadata.execution.events[0].at_ms)
+      }
       if (!user) throw new Error("Expected user message")
 
       // Poll for the turn diff — summarize() is fire-and-forget.
