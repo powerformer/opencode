@@ -21,6 +21,7 @@ import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
+import { completedToolUpdate, runningToolUpdate, duplicateRunningToolUpdate } from "@/acp/tool"
 
 const shellLayer = Layer.mergeAll(
   LayerNode.compile(
@@ -190,6 +191,45 @@ describe("tool.shell", () => {
         })
         expect(result.metadata.exit).toBe(0)
         expect(result.metadata.output).toContain("test")
+        expect(result.metadata.execution).toMatchObject({
+          version: 1,
+          requested_timeout_ms: null,
+          terminal: "returned",
+        })
+        const events = result.metadata.execution.events
+        expect(events.map((event) => event.phase)).toEqual(
+          expect.arrayContaining([
+            "spawn_requested",
+            "spawn",
+            "exit",
+            "close",
+            "release_started",
+            "release_finished",
+            "executor_settled",
+          ]),
+        )
+        expect(events.at(-1)?.phase).toBe("executor_settled")
+        expect(events.find((event) => event.phase === "exit")?.code).toBe(0)
+        expect(events.find((event) => event.phase === "close")).toMatchObject({
+          stdout_closed: true,
+          stderr_closed: true,
+        })
+        expect(events.findIndex((event) => event.phase === "exit")).toBeLessThan(
+          events.findIndex((event) => event.phase === "close"),
+        )
+        expect(JSON.stringify(result.metadata.execution)).not.toContain(projectRoot)
+        expect(JSON.stringify(result.metadata.execution)).not.toContain("echo test")
+        const update = completedToolUpdate({
+          toolCallId: "fixture",
+          toolName: "bash",
+          state: {
+            status: "completed",
+            input: {},
+            output: result.output,
+            metadata: result.metadata,
+          },
+        })
+        expect(update.rawOutput).toMatchObject({ metadata: { execution: result.metadata.execution } })
       }),
     ),
   )
@@ -1008,6 +1048,133 @@ describe("tool.shell permissions", () => {
 
 describe("tool.shell abort", () => {
   it.live(
+    "a stalled final diagnostic write cannot prevent the tool result",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const result = yield* run(
+            { command: "echo fixture-finished" },
+            {
+              ...ctx,
+              metadata: (input) => (input.metadata?.execution?.terminal === "returned" ? Effect.never : Effect.void),
+            },
+          )
+          expect(result.metadata.execution.terminal).toBe("returned")
+          expect(result.metadata.exit).toBe(0)
+        }),
+      ),
+    5000,
+  )
+
+  it.live("retains safe failure diagnostics when the executor cannot access cwd", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const snapshots: unknown[] = []
+      const exit = yield* runIn(
+        dir,
+        run(
+          { command: "echo private-fixture-command", workdir: "missing-directory" },
+          {
+            ...ctx,
+            metadata: (input) =>
+              Effect.sync(() => {
+                snapshots.push(input.metadata?.execution)
+              }),
+          },
+        ),
+      ).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(snapshots.at(-1)).toMatchObject({
+        terminal: "failed",
+        events: expect.arrayContaining([
+          expect.objectContaining({
+            phase: "executor_settled",
+            error: expect.arrayContaining([expect.objectContaining({ code: "ENOENT" })]),
+          }),
+        ]),
+      })
+      expect(JSON.stringify(snapshots)).not.toMatch(/private-fixture|missing-directory/)
+    }),
+  )
+
+  if (process.platform !== "win32") {
+    it.live(
+      "observes parent exit before inherited pipes close and forwards progress over ACP",
+      () =>
+        Effect.gen(function* () {
+          const dir = yield* tmpdirScoped()
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(dir, "child.js"),
+              `
+          process.on("SIGTERM", () => {});
+          console.log("fixture-ready");
+          setTimeout(() => process.exit(0), 10000);
+        `,
+            ),
+          )
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(dir, "parent.js"),
+              `
+          const { spawn } = require("node:child_process");
+          spawn(process.execPath, ["child.js"], { stdio: ["ignore", "inherit", "inherit"] }).unref();
+          process.exit(0);
+        `,
+            ),
+          )
+          const controller = new AbortController()
+          const progress: { running: unknown; duplicate: unknown }[] = []
+          const observations: Tool.InferMetadata<typeof ShellTool>["execution"][] = []
+          const result = yield* runIn(
+            dir,
+            run(
+              { command: `exec ${bin} parent.js`, timeout: 15000 },
+              {
+                ...ctx,
+                abort: controller.signal,
+                metadata: (input) =>
+                  Effect.sync(() => {
+                    const state = { status: "running" as const, input: {}, metadata: input.metadata }
+                    const update = runningToolUpdate({ toolCallId: "fixture", toolName: "bash", state })
+                    const duplicate = duplicateRunningToolUpdate({ toolCallId: "fixture", toolName: "bash", state })
+                    progress.push({ running: update.rawOutput, duplicate: duplicate.rawOutput })
+                    const execution = input.metadata?.execution as
+                      | Tool.InferMetadata<typeof ShellTool>["execution"]
+                      | undefined
+                    if (!execution?.events.some((event) => event.phase === "exit")) return
+                    if (!String(input.metadata?.output).includes("fixture-ready") || controller.signal.aborted) return
+                    observations.push(execution)
+                    controller.abort()
+                    controller.abort()
+                  }),
+              },
+            ),
+          )
+          expect(controller.signal.aborted).toBe(true)
+          expect(progress.length).toBeGreaterThan(1)
+          for (const update of progress) expect(update.running).toEqual(update.duplicate)
+          expect(observations).toHaveLength(1)
+          expect(observations[0].terminal).toBe("running")
+          expect(observations[0].events.some((event) => event.phase === "close")).toBe(false)
+          const events = result.metadata.execution.events
+          expect(events.filter((event) => event.phase === "abort_observed")).toHaveLength(1)
+          expect(events.findIndex((event) => event.phase === "exit")).toBeLessThan(
+            events.findIndex((event) => event.phase === "abort_observed"),
+          )
+          expect(events.filter((event) => event.phase === "kill_sent").map((event) => event.signal)).toEqual([
+            "SIGTERM",
+            "SIGKILL",
+          ])
+          expect(events.at(-1)?.phase).toBe("executor_settled")
+          expect(result.metadata.execution).toMatchObject({ trigger: "abort", terminal: "returned" })
+        }),
+      20000,
+    )
+  }
+
+  it.live(
     "preserves output when aborted",
     () =>
       runIn(
@@ -1028,12 +1195,19 @@ describe("tool.shell abort", () => {
                   if (output && output.includes("before") && !controller.signal.aborted) {
                     collected.push(output)
                     controller.abort()
+                    controller.abort()
                   }
                 }),
             },
           )
           expect(res.output).toContain("before")
           expect(res.output).toContain("User aborted the command")
+          expect(res.metadata.execution).toMatchObject({ terminal: "returned", trigger: "abort" })
+          expect(res.metadata.execution.events.filter((event) => event.phase === "abort_observed")).toHaveLength(1)
+          expect(res.metadata.execution.events.filter((event) => event.phase === "kill_settled")).toHaveLength(1)
+          const frozen = JSON.stringify(res.metadata.execution)
+          controller.abort()
+          expect(JSON.stringify(res.metadata.execution)).toBe(frozen)
           expect(collected.length).toBeGreaterThan(0)
         }),
       ),
@@ -1052,6 +1226,19 @@ describe("tool.shell abort", () => {
           })
           expect(result.output).toContain("shell tool terminated command after exceeding timeout")
           expect(result.output).toContain("retry with a larger timeout value in milliseconds")
+          expect(result.metadata.execution).toMatchObject({
+            requested_timeout_ms: 500,
+            effective_timeout_ms: 600,
+            trigger: "deadline",
+            terminal: "returned",
+          })
+          const events = result.metadata.execution.events
+          expect(events.findIndex((event) => event.phase === "deadline")).toBeLessThan(
+            events.findIndex((event) => event.phase === "kill_requested"),
+          )
+          expect(events.findIndex((event) => event.phase === "close")).toBeLessThan(
+            events.findIndex((event) => event.phase === "kill_settled"),
+          )
         }),
       ),
     15_000,
@@ -1072,6 +1259,7 @@ describe("tool.shell abort", () => {
             ctx,
           )
           expect(result.output).toContain("exceeding timeout 500 ms")
+          expect(result.metadata.execution).toMatchObject({ requested_timeout_ms: null, effective_timeout_ms: 600 })
         }),
       ).pipe(Effect.provide(RuntimeFlags.layer({ bashDefaultTimeoutMs: 500 }))),
     15_000,
