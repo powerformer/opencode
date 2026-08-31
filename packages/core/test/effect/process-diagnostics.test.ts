@@ -1,14 +1,17 @@
 import { Database } from "bun:sqlite"
 import { expect, test } from "bun:test"
-import { Cause, Effect, Exit, Stream } from "effect"
+import { Cause, Effect, Exit, FileSystem, Path, Stream } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { ExitCode } from "effect/unstable/process/ChildProcessSpawner"
 import { LayerNode } from "../../src/effect/layer-node"
+import { LayerNodePlatform } from "../../src/effect/app-node-platform"
 import { CrossSpawnSpawner } from "../../src/cross-spawn-spawner"
 import { ProcessDiagnostics } from "../../src/process-diagnostics"
 import { testEffect } from "../lib/effect"
 
-const it = testEffect(LayerNode.compile(CrossSpawnSpawner.node))
+const it = testEffect(
+  LayerNode.compile(LayerNode.group([CrossSpawnSpawner.node, LayerNodePlatform.filesystem, LayerNodePlatform.path])),
+)
 
 it.live("isolates native lifecycle observers across concurrent processes", () =>
   Effect.gen(function* () {
@@ -43,20 +46,68 @@ it.live("isolates native lifecycle observers across concurrent processes", () =>
 it.live("retains the native spawn error code without command or path data", () =>
   Effect.gen(function* () {
     const events: ProcessDiagnostics.Event[] = []
-    const exit = yield* ChildProcess.make("nonexistent-n5-fixture-command").pipe(
+    const fs = yield* FileSystem.FileSystem
+    const path = yield* Path.Path
+    const directory = yield* fs.makeTempDirectoryScoped()
+    // An explicit missing shell fails before spawn on both Windows and POSIX.
+    const exit = yield* ChildProcess.make("nonexistent-n5-fixture-command", [], {
+      shell: path.join(directory, "nonexistent-n5-fixture-shell"),
+    }).pipe(
       Effect.provideService(ProcessDiagnostics.Observer, (event) => events.push(event)),
       Effect.exit,
     )
     expect(Exit.isFailure(exit)).toBe(true)
+    expect(events.some((event) => event.phase === "spawn")).toBe(false)
     expect(events.find((event) => event.phase === "spawn_error")?.error).toEqual(
       expect.arrayContaining([expect.objectContaining({ code: "ENOENT" })]),
     )
     expect(JSON.stringify(events)).not.toContain("nonexistent-n5-fixture-command")
+    expect(JSON.stringify(events)).not.toContain("nonexistent-n5-fixture-shell")
+    expect(JSON.stringify(events)).not.toContain(directory)
     if (Exit.isFailure(exit)) {
       expect(ProcessDiagnostics.errorChain(Cause.squash(exit.cause))).toEqual(
         expect.arrayContaining([expect.objectContaining({ code: "ENOENT" })]),
       )
     }
+  }),
+)
+
+it.live("retains missing-command diagnostics after process settlement", () =>
+  Effect.gen(function* () {
+    const events: ProcessDiagnostics.Event[] = []
+    const exit = yield* Effect.gen(function* () {
+      const handle = yield* ChildProcess.make("nonexistent-n5-fixture-command")
+      // Windows can spawn cmd.exe before cross-spawn reports the missing command.
+      return yield* handle.exitCode
+    }).pipe(
+      Effect.scoped,
+      Effect.provideService(ProcessDiagnostics.Observer, (event) => events.push(event)),
+      Effect.exit,
+    )
+    expect(Exit.isFailure(exit) ? true : exit.value !== ExitCode(0)).toBe(true)
+    expect(events.find((event) => event.phase === "spawn_error")?.error).toEqual(
+      expect.arrayContaining([expect.objectContaining({ code: "ENOENT" })]),
+    )
+    expect(JSON.stringify(events)).not.toContain("nonexistent-n5-fixture-command")
+  }),
+)
+
+it.live("records a shell command failure after a successful spawn", () =>
+  Effect.gen(function* () {
+    const events: ProcessDiagnostics.Event[] = []
+    const code = yield* Effect.gen(function* () {
+      const handle = yield* ChildProcess.make("nonexistent-n5-fixture-command", [], { shell: true })
+      return yield* handle.exitCode
+    }).pipe(
+      Effect.scoped,
+      Effect.provideService(ProcessDiagnostics.Observer, (event) => events.push(event)),
+    )
+    expect(code).not.toBe(ExitCode(0))
+    expect(events.map((event) => event.phase)).toEqual(
+      expect.arrayContaining(["spawn_requested", "spawn", "exit", "close", "release_finished"]),
+    )
+    expect(events.some((event) => event.phase === "spawn_error")).toBe(false)
+    expect(JSON.stringify(events)).not.toContain("nonexistent-n5-fixture-command")
   }),
 )
 
