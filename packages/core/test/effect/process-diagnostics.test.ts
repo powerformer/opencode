@@ -96,18 +96,20 @@ it.live("records a shell command failure after a successful spawn", () =>
   Effect.gen(function* () {
     const events: ProcessDiagnostics.Event[] = []
     const code = yield* Effect.gen(function* () {
-      const handle = yield* ChildProcess.make("nonexistent-n5-fixture-command", [], { shell: true })
+      // cross-spawn reserves exit code 1 for synthetic ENOENT on Windows.
+      const handle = yield* ChildProcess.make("exit", ["7"], { shell: true })
       return yield* handle.exitCode
     }).pipe(
       Effect.scoped,
       Effect.provideService(ProcessDiagnostics.Observer, (event) => events.push(event)),
     )
-    expect(code).not.toBe(ExitCode(0))
+    expect(code).toBe(ExitCode(7))
     expect(events.map((event) => event.phase)).toEqual(
       expect.arrayContaining(["spawn_requested", "spawn", "exit", "close", "release_finished"]),
     )
     expect(events.some((event) => event.phase === "spawn_error")).toBe(false)
-    expect(JSON.stringify(events)).not.toContain("nonexistent-n5-fixture-command")
+    expect(events.find((event) => event.phase === "exit")?.code).toBe(7)
+    expect(events.find((event) => event.phase === "close")?.code).toBe(7)
   }),
 )
 
