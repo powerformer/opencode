@@ -19,6 +19,7 @@ export type CompletedToolState = {
 
 export type RunningToolState = {
   readonly status: "running"
+  readonly metadata?: unknown
   readonly input: ToolInput
   readonly title?: string
 }
@@ -163,6 +164,7 @@ export function runningToolUpdate(input: {
     title: toolTitle(input.toolName, input.state.input, input.state.title),
     locations: toLocations(input.toolName, input.state.input, input.cwd),
     rawInput: rawInput(input.toolName, input.state.input, input.cwd),
+    ...executionOutput(input.state),
     ...(content ? { content } : {}),
   }
 }
@@ -180,6 +182,7 @@ export function duplicateRunningToolUpdate(input: {
     title: toolTitle(input.toolName, input.state.input, input.state.title),
     locations: toLocations(input.toolName, input.state.input, input.cwd),
     rawInput: rawInput(input.toolName, input.state.input, input.cwd),
+    ...executionOutput(input.state),
   }
 }
 
@@ -361,4 +364,10 @@ function dataUrlImage(attachment: ToolAttachment) {
 
 function stringValue(value: unknown) {
   return typeof value === "string" ? value : undefined
+}
+
+// Progress snapshots carry only the executor diagnostics, not arbitrary tool metadata.
+function executionOutput(state: { readonly metadata?: unknown }) {
+  if (!state.metadata || typeof state.metadata !== "object" || !("execution" in state.metadata)) return {}
+  return { rawOutput: { metadata: { execution: state.metadata.execution } } }
 }

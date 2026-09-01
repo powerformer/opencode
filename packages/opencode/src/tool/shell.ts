@@ -1,4 +1,5 @@
-import { Effect, Stream } from "effect"
+import { Cause, Effect, Exit, Queue, Stream } from "effect"
+import { ProcessDiagnostics } from "@opencode-ai/core/process-diagnostics"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -432,167 +433,259 @@ export const ShellTool = Tool.define(
         cwd: string
         env: NodeJS.ProcessEnv
         timeout: number
+        requestedTimeout?: number
       },
       ctx: Tool.Context,
     ) {
-      const limits = yield* trunc.limits()
-      const keep = limits.maxBytes * 2
-      let full = ""
+      const events: (ProcessDiagnostics.Event & { at_ms: number; elapsed_ms: number })[] = []
+      const started = performance.now()
+      const execution = {
+        version: 1,
+        requested_timeout_ms: input.requestedTimeout ?? null,
+        // Preserve the existing 100ms grace and three-second escalation policy.
+        effective_timeout_ms: input.timeout + 100,
+        force_kill_after_ms: 3000,
+        trigger: undefined as "exit" | "abort" | "deadline" | undefined,
+        terminal: "running" as "running" | "returned" | "failed" | "interrupted",
+        dropped_events: 0,
+      }
+      const queue = yield* Queue.make<(typeof events)[number]>({ capacity: 64, strategy: "dropping" })
+      const snapshot = () => ({ ...execution, events: events.slice() })
+      const observe = (event: ProcessDiagnostics.Event) => {
+        if (events.length === 64) {
+          events.shift()
+          execution.dropped_events++
+        }
+        const timed = { ...event, at_ms: Date.now(), elapsed_ms: Math.round(performance.now() - started) }
+        events.push(timed)
+        Queue.offerUnsafe(queue, timed)
+      }
+      const publish = () =>
+        ctx
+          .metadata({ metadata: { output: last, execution: snapshot() } })
+          .pipe(Effect.interruptible, Effect.timeoutOption("100 millis"), Effect.ignoreCause, Effect.asVoid)
       let last = ""
-      const list: Chunk[] = []
-      let used = 0
-      let file = ""
-      let sink: ReturnType<typeof createWriteStream> | undefined
-      let cut = false
-      let expired = false
-      let aborted = false
+      yield* Effect.forkScoped(
+        Stream.runForEach(Stream.fromQueue(queue), (event) =>
+          Effect.logInfo("tool.execution", {
+            "session.id": ctx.sessionID,
+            "message.id": ctx.messageID,
+            ...(ctx.callID ? { "tool.call_id": ctx.callID } : {}),
+            execution: { ...execution, event },
+          }).pipe(Effect.andThen(publish())),
+        ),
+      )
+      return yield* Effect.gen(function* () {
+        const limits = yield* trunc.limits()
+        const keep = limits.maxBytes * 2
+        let full = ""
+        const list: Chunk[] = []
+        let used = 0
+        let file = ""
+        let sink: ReturnType<typeof createWriteStream> | undefined
+        let cut = false
+        let expired = false
+        let aborted = false
 
-      const closeSink = Effect.fnUntraced(function* () {
-        const stream = sink
-        if (!stream) return
-        sink = undefined
-        if (stream.destroyed || stream.closed) return
-        yield* Effect.promise(
-          () =>
-            new Promise<void>((resolve) => {
-              let settled = false
-              const done = () => {
-                if (settled) return
-                settled = true
-                stream.off("close", done)
-                stream.off("error", done)
-                stream.off("finish", done)
-                resolve()
-              }
-              stream.once("close", done)
-              stream.once("error", done)
-              stream.once("finish", done)
-              stream.end(done)
-            }),
-        ).pipe(Effect.catch(() => Effect.void))
-      })
-
-      yield* ctx.metadata({
-        metadata: {
-          output: "",
-        },
-      })
-
-      const code: number | null = yield* Effect.scoped(
-        Effect.gen(function* () {
-          yield* Effect.addFinalizer(closeSink)
-          const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
-
-          yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
-                const item = list.shift()
-                if (!item) break
-                used -= item.size
-                cut = true
-              }
-
-              last = preview(last + chunk)
-
-              if (file) {
-                sink?.write(chunk)
-              } else {
-                full += chunk
-                if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                  return trunc.write(full).pipe(
-                    Effect.andThen((next) =>
-                      Effect.sync(() => {
-                        file = next
-                        cut = true
-                        sink = createWriteStream(next, { flags: "a" })
-                        full = ""
-                      }),
-                    ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                        },
-                      }),
-                    ),
-                  )
+        const closeSink = Effect.fnUntraced(function* () {
+          const stream = sink
+          if (!stream) return
+          sink = undefined
+          if (stream.destroyed || stream.closed) return
+          observe({ phase: "output_sink_close_requested" })
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve) => {
+                let settled = false
+                const done = (error?: Error | null) => {
+                  if (settled) return
+                  settled = true
+                  observe({
+                    phase: "output_sink_settled",
+                    outcome: error ? "failure" : "success",
+                    ...(error ? { error: ProcessDiagnostics.errorChain(error) } : {}),
+                  })
+                  stream.off("close", done)
+                  stream.off("error", done)
+                  stream.off("finish", done)
+                  resolve()
                 }
+                stream.once("close", done)
+                stream.once("error", done)
+                stream.once("finish", done)
+                stream.end(done)
+              }),
+          ).pipe(Effect.catch(() => Effect.void))
+        })
+
+        yield* ctx.metadata({
+          metadata: {
+            output: "",
+            execution: snapshot(),
+          },
+        })
+
+        const code: number | null = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* Effect.addFinalizer(closeSink)
+            const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+
+            yield* Effect.forkScoped(
+              Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
+                const size = Buffer.byteLength(chunk, "utf-8")
+                list.push({ text: chunk, size })
+                used += size
+                while (used > keep && list.length > 1) {
+                  const item = list.shift()
+                  if (!item) break
+                  used -= item.size
+                  cut = true
+                }
+
+                last = preview(last + chunk)
+
+                if (file) {
+                  sink?.write(chunk)
+                } else {
+                  full += chunk
+                  if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+                    return trunc.write(full).pipe(
+                      Effect.andThen((next) =>
+                        Effect.sync(() => {
+                          file = next
+                          cut = true
+                          sink = createWriteStream(next, { flags: "a" })
+                          full = ""
+                        }),
+                      ),
+                      Effect.andThen(
+                        ctx.metadata({
+                          metadata: {
+                            output: last,
+                            execution: snapshot(),
+                          },
+                        }),
+                      ),
+                    )
+                  }
+                }
+
+                return ctx.metadata({
+                  metadata: {
+                    output: last,
+                    execution: snapshot(),
+                  },
+                })
+              }).pipe(
+                Effect.onExit((exit) =>
+                  Effect.sync(() =>
+                    observe({
+                      phase: "output_consumer_finished",
+                      outcome: Exit.isSuccess(exit)
+                        ? "success"
+                        : Cause.hasInterruptsOnly(exit.cause)
+                          ? "interrupted"
+                          : "failure",
+                      ...(Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)
+                        ? { error: ProcessDiagnostics.errorChain(Cause.squash(exit.cause)) }
+                        : {}),
+                    }),
+                  ),
+                ),
+              ),
+            )
+
+            const abort = Effect.callback<void>((resume) => {
+              const handler = () => {
+                observe({ phase: "abort_observed" })
+                resume(Effect.void)
               }
+              if (ctx.abort.aborted) return handler()
+              ctx.abort.addEventListener("abort", handler, { once: true })
+              return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
+            })
 
-              return ctx.metadata({
-                metadata: {
-                  output: last,
-                },
-              })
-            }),
+            const timeout = Effect.sleep(`${input.timeout + 100} millis`).pipe(
+              Effect.tap(() => Effect.sync(() => observe({ phase: "deadline" }))),
+            )
+
+            const exit = yield* Effect.raceAll([
+              handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
+              abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
+              timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
+            ])
+
+            execution.trigger = exit.kind === "timeout" ? "deadline" : exit.kind
+            if (exit.kind === "abort") {
+              aborted = true
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+              observe({ phase: "kill_settled" })
+            }
+            if (exit.kind === "timeout") {
+              expired = true
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+              observe({ phase: "kill_settled" })
+            }
+
+            return exit.kind === "exit" ? exit.code : null
+          }),
+        ).pipe(Effect.orDie)
+
+        const meta: string[] = []
+        if (expired) {
+          meta.push(
+            `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
           )
+        }
+        if (aborted) meta.push("User aborted the command")
+        const raw = list.map((item) => item.text).join("")
+        const end = tail(raw, limits.maxLines, limits.maxBytes)
+        if (end.cut) cut = true
+        if (!file && end.cut) {
+          file = yield* trunc.write(raw)
+        }
 
-          const abort = Effect.callback<void>((resume) => {
-            if (ctx.abort.aborted) return resume(Effect.void)
-            const handler = () => resume(Effect.void)
-            ctx.abort.addEventListener("abort", handler, { once: true })
-            return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
-          })
+        let output = end.text
+        if (!output) output = "(no output)"
 
-          const timeout = Effect.sleep(`${input.timeout + 100} millis`)
+        if (cut && file) {
+          output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
+        }
 
-          const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
-            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
-          ])
-
-          if (exit.kind === "abort") {
-            aborted = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
-          if (exit.kind === "timeout") {
-            expired = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
-
-          return exit.kind === "exit" ? exit.code : null
-        }),
-      ).pipe(Effect.orDie)
-
-      const meta: string[] = []
-      if (expired) {
-        meta.push(
-          `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
-        )
-      }
-      if (aborted) meta.push("User aborted the command")
-      const raw = list.map((item) => item.text).join("")
-      const end = tail(raw, limits.maxLines, limits.maxBytes)
-      if (end.cut) cut = true
-      if (!file && end.cut) {
-        file = yield* trunc.write(raw)
-      }
-
-      let output = end.text
-      if (!output) output = "(no output)"
-
-      if (cut && file) {
-        output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
-      }
-
-      if (meta.length > 0) {
-        output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
-      }
-      return {
-        title: input.command,
-        metadata: {
-          output: last || preview(output),
-          exit: code,
-          truncated: cut,
-          ...(cut && file ? { outputPath: file } : {}),
-        },
-        output,
-      }
-    })
+        if (meta.length > 0) {
+          output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
+        }
+        return {
+          title: input.command,
+          metadata: {
+            output: last || preview(output),
+            exit: code,
+            truncated: cut,
+            ...(cut && file ? { outputPath: file } : {}),
+          },
+          output,
+        }
+      }).pipe(
+        Effect.provideService(ProcessDiagnostics.Observer, observe),
+        Effect.onExit((exit) =>
+          Effect.gen(function* () {
+            execution.terminal = Exit.isSuccess(exit)
+              ? "returned"
+              : Cause.hasInterruptsOnly(exit.cause)
+                ? "interrupted"
+                : "failed"
+            observe({
+              phase: "executor_settled",
+              ...(Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)
+                ? { error: ProcessDiagnostics.errorChain(Cause.squash(exit.cause)) }
+                : {}),
+            })
+            yield* publish()
+          }),
+        ),
+        Effect.map((result) => ({ ...result, metadata: { ...result.metadata, execution: snapshot() } })),
+      )
+    }, Effect.scoped)
 
     return () =>
       Effect.gen(function* () {
@@ -635,6 +728,7 @@ export const ShellTool = Tool.define(
                   cwd,
                   env: yield* shellEnv(ctx, cwd),
                   timeout,
+                  requestedTimeout: params.timeout,
                 },
                 ctx,
               )
