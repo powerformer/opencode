@@ -94,6 +94,7 @@ export const SessionPaths = {
   summarize: `${root}/:sessionID/summarize`,
   prompt: `${root}/:sessionID/message`,
   promptAsync: `${root}/:sessionID/prompt_async`,
+  continue: `${root}/:sessionID/continue`,
   command: `${root}/:sessionID/command`,
   shell: `${root}/:sessionID/shell`,
   revert: `${root}/:sessionID/revert`,
@@ -338,6 +339,19 @@ export const SessionApi = HttpApi.make("session")
             summary: "Send async message",
             description:
               "Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.",
+          }),
+        ),
+        HttpApiEndpoint.post("continue", SessionPaths.continue, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: SessionPrompt.ContinuationCursor,
+          success: described(SessionV1.WithParts, "Continued assistant message"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError, SessionBusyError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.continue",
+            summary: "Continue a committed tool result",
+            description: "Continue an idle session from an exact persisted cursor without adding a user prompt. Rejects changed history and uncommitted tools.",
           }),
         ),
         HttpApiEndpoint.post("command", SessionPaths.command, {
