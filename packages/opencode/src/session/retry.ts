@@ -65,7 +65,12 @@ function hint(error?: SessionV1.APIError) {
 export function delay(attempt: number, error?: SessionV1.APIError, random = Math.random()) {
   const exact = hint(error)
   if (exact !== undefined) return exact
-  return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1) * (1 + RETRY_JITTER_FACTOR * random), RETRY_MAX_DELAY_NO_HEADERS))
+  return cap(
+    Math.min(
+      Math.ceil(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1) * (1 + RETRY_JITTER_FACTOR * random)),
+      RETRY_MAX_DELAY_NO_HEADERS,
+    ),
+  )
 }
 
 function jitter(ms: number) {
@@ -80,7 +85,9 @@ export function retryable(error: Err, provider: string) {
     const status = error.data.statusCode
     const transient =
       status === undefined
-        ? error.data.isRetryable || matchesRetryableMessage(error.data.message) || matchesRetryableMessage(error.data.responseBody)
+        ? error.data.isRetryable ||
+          matchesRetryableMessage(error.data.message) ||
+          matchesRetryableMessage(error.data.responseBody)
         : status === 408 || status === 429 || status >= 500 || (status === 404 && error.data.isRetryable)
     if (!transient) return undefined
     if (error.data.responseBody?.includes("FreeUsageLimitError")) {

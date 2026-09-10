@@ -22,7 +22,9 @@ const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
 const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
-const targetFlag = process.argv.find((arg) => arg.startsWith("--target="))?.slice("--target=".length) ?? process.env.OPENCODE_BUILD_TARGET
+const targetFlag =
+  process.argv.find((arg) => arg.startsWith("--target="))?.slice("--target=".length) ??
+  process.env.OPENCODE_BUILD_TARGET
 
 const createEmbeddedWebUIBundle = async () => {
   console.log(`Building Web UI to embed in the binary`)
