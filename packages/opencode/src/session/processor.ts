@@ -1,3 +1,4 @@
+import { WriteProgress } from "./write-progress"
 import { ProcessDiagnostics } from "@opencode-ai/core/process-diagnostics"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
@@ -116,6 +117,10 @@ const layer = Layer.effect(
         retryAttempts: 0,
       }
       let aborted = false
+      const writeProgress = WriteProgress.tracker(events, {
+        sessionID: input.sessionID,
+        messageID: input.assistantMessage.id,
+      })
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -308,6 +313,35 @@ const layer = Layer.effect(
       }
 
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+        if ("name" in value && value.name === "write" && "id" in value) {
+          if (value.type === "tool-input-start") yield* writeProgress.observe(value.id, "input_started")
+          if (value.type === "tool-input-delta") yield* writeProgress.observe(value.id, "input_progress", value.text)
+          if (value.type === "tool-input-end") yield* writeProgress.observe(value.id, "input_ended")
+          if (value.type === "tool-call")
+            yield* writeProgress.observe(value.id, "arguments_ready", undefined, value.input)
+        }
+        if (
+          value.type === "tool-call" &&
+          value.name === "invalid" &&
+          typeof value.input === "object" &&
+          value.input !== null &&
+          "tool" in value.input &&
+          value.input.tool === "write"
+        ) {
+          yield* writeProgress.observe(value.id, "validation_failed", undefined, undefined, "tool_error")
+        }
+        if (
+          (value.type === "tool-result" || value.type === "tool-error") &&
+          (value.name === "write" || writeProgress.has(value.id))
+        ) {
+          const error =
+            value.type === "tool-error" ? value.error : value.result.type === "error" ? value.result.value : undefined
+          const failed = value.type === "tool-error" || value.result.type === "error"
+          const kind = failed ? WriteProgress.errorKind(error) : undefined
+          if (kind === "schema_invalid" || kind === "json_invalid")
+            yield* writeProgress.observe(value.id, "validation_failed", undefined, undefined, kind)
+          yield* writeProgress.observe(value.id, "result_observed", undefined, undefined, kind)
+        }
         switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
@@ -722,10 +756,12 @@ const layer = Layer.effect(
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
+            yield* writeProgress.finish("stream_finished")
           }).pipe(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {
                 aborted = true
+                yield* writeProgress.finish("interrupted")
                 if (!ctx.assistantMessage.error) {
                   yield* halt(new DOMException("Aborted", "AbortError"))
                 }
@@ -733,7 +769,7 @@ const layer = Layer.effect(
             ),
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
-              (cause) => Effect.fail(Cause.squash(cause)),
+              (cause) => writeProgress.finish("stream_failed").pipe(Effect.andThen(Effect.fail(Cause.squash(cause)))),
             ),
             Effect.retry(
               SessionRetry.policy({

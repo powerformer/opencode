@@ -277,3 +277,32 @@ describe("tool.write", () => {
     )
   })
 })
+
+it.instance("reports Write execution boundaries without context or content", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const events = yield* EventV2Bridge.Service
+    const records: unknown[] = []
+    const unsub = yield* events.listen((event) =>
+      Effect.sync(() => {
+        if (event.type === "session.write_progress") records.push(event.data)
+      }),
+    )
+    yield* Effect.addFinalizer(() => unsub)
+    const filepath = path.join(test.directory, "private.txt")
+    yield* run(
+      { filePath: filepath, content: "SECRET-CONTENT" },
+      { ...ctx, callID: "write-test", extra: { secret: "SECRET-CONTEXT" } },
+    )
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ phase: "execution_started" }),
+        expect.objectContaining({ phase: "file_write_started" }),
+        expect.objectContaining({ phase: "file_write_finished" }),
+        expect.objectContaining({ phase: "execution_returned" }),
+      ]),
+    )
+    expect(JSON.stringify(records)).not.toMatch(/SECRET|private.txt|extra|messages|abort/)
+    expect(yield* Effect.promise(() => fs.readFile(filepath, "utf-8"))).toBe("SECRET-CONTENT")
+  }),
+)

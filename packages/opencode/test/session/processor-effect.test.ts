@@ -1232,3 +1232,69 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
     { config: cfg },
   ),
 )
+
+const writeProgressEnv = LayerNode.compile(root, [
+  ...replacements,
+  [
+    LLM.node,
+    Layer.succeed(
+      LLM.Service,
+      LLM.Service.of({
+        stream: () =>
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.toolInputStart({ id: "write-private", name: "write" }),
+            LLMEvent.toolInputDelta({
+              id: "write-private",
+              name: "write",
+              text: '{"filePath":"/secret/path","content":"SECRET',
+            }),
+            LLMEvent.toolError({ id: "write-error", name: "write", message: "SECRET-ERROR-PROSE" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+      }),
+    ),
+  ],
+])
+const itWriteProgress = testEffect(writeProgressEnv)
+itWriteProgress.live("Write progress preserves incomplete input evidence without content", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const records: unknown[] = []
+        const unsub = yield* events.listen((event) =>
+          Effect.sync(() => {
+            if (event.type === "session.write_progress") records.push(event.data)
+          }),
+        )
+        yield* Effect.addFinalizer(() => unsub)
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "write")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        yield* handle.process({
+          user: { id: parent.id, sessionID: chat.id, role: "user", time: parent.time, agent: parent.agent, model: ref },
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "write" }],
+          tools: {},
+        })
+        expect(records).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ phase: "input_started", inputBytes: 0 }),
+            expect.objectContaining({ phase: "result_observed", callID: "write-error", errorKind: "tool_error" }),
+            expect.objectContaining({ phase: "input_progress", inputBytes: 44 }),
+            expect.objectContaining({ phase: "stream_finished", inputEnded: false, inputBytes: 44 }),
+          ]),
+        )
+        expect(JSON.stringify(records)).not.toContain("SECRET")
+        expect(JSON.stringify(records)).not.toContain("/secret/path")
+      }),
+    { config: cfg },
+  ),
+)

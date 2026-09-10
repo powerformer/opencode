@@ -1,6 +1,7 @@
+import { WriteProgress } from "../session/write-progress"
 import { Schema } from "effect"
 import * as path from "path"
-import { Effect } from "effect"
+import { Cause, Effect } from "effect"
 import * as Tool from "./tool"
 import { LSP } from "@/lsp/lsp"
 import { createTwoFilesPatch } from "diff"
@@ -37,6 +38,7 @@ export const WriteTool = Tool.define(
       parameters: Parameters,
       execute: (params: { content: string; filePath: string }, ctx: Tool.Context) =>
         Effect.gen(function* () {
+          yield* WriteProgress.report(events, ctx, "execution_started", { hasContent: true, hasFilePath: true })
           const instance = yield* InstanceState.context
           const filepath = path.isAbsolute(params.filePath)
             ? params.filePath
@@ -51,6 +53,7 @@ export const WriteTool = Tool.define(
           const contentNew = next.text
 
           const diff = trimDiff(createTwoFilesPatch(filepath, filepath, contentOld, contentNew))
+          yield* WriteProgress.report(events, ctx, "permission_requested")
           yield* ctx.ask({
             permission: "edit",
             patterns: [path.relative(instance.worktree, filepath)],
@@ -61,7 +64,10 @@ export const WriteTool = Tool.define(
             },
           })
 
+          yield* WriteProgress.report(events, ctx, "file_write_started")
           yield* fs.writeWithDirs(filepath, Bom.join(contentNew, desiredBom))
+          yield* WriteProgress.report(events, ctx, "file_write_finished")
+          yield* WriteProgress.report(events, ctx, "postprocess_started")
           if (yield* format.file(filepath)) {
             yield* Bom.syncFile(fs, filepath, desiredBom)
           }
@@ -89,6 +95,7 @@ export const WriteTool = Tool.define(
             output += `\n\nLSP errors detected in other files:\n${block}`
           }
 
+          yield* WriteProgress.report(events, ctx, "execution_returned")
           return {
             title: path.relative(instance.worktree, filepath),
             metadata: {
@@ -98,7 +105,14 @@ export const WriteTool = Tool.define(
             },
             output,
           }
-        }).pipe(Effect.orDie),
+        }).pipe(
+          Effect.tapCause((cause) =>
+            WriteProgress.report(events, ctx, "execution_failed", {
+              errorKind: Cause.hasInterruptsOnly(cause) ? "aborted" : "tool_error",
+            }),
+          ),
+          Effect.orDie,
+        ),
     }
   }),
 )
