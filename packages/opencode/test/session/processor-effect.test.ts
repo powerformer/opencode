@@ -1249,6 +1249,7 @@ const writeProgressEnv = LayerNode.compile(root, [
               name: "write",
               text: '{"filePath":"/secret/path","content":"SECRET',
             }),
+            LLMEvent.toolError({ id: "write-error", name: "write", message: "SECRET-ERROR-PROSE" }),
             LLMEvent.finish({ reason: "stop" }),
           ),
       }),
@@ -1286,6 +1287,7 @@ itWriteProgress.live("Write progress preserves incomplete input evidence without
         expect(records).toEqual(
           expect.arrayContaining([
             expect.objectContaining({ phase: "input_started", inputBytes: 0 }),
+            expect.objectContaining({ phase: "result_observed", callID: "write-error", errorKind: "tool_error" }),
             expect.objectContaining({ phase: "input_progress", inputBytes: 44 }),
             expect.objectContaining({ phase: "stream_finished", inputEnded: false, inputBytes: 44 }),
           ]),

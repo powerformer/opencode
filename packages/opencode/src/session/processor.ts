@@ -336,7 +336,8 @@ const layer = Layer.effect(
         ) {
           const error =
             value.type === "tool-error" ? value.error : value.result.type === "error" ? value.result.value : undefined
-          const kind = error !== undefined ? WriteProgress.errorKind(error) : undefined
+          const failed = value.type === "tool-error" || value.result.type === "error"
+          const kind = failed ? WriteProgress.errorKind(error) : undefined
           if (kind === "schema_invalid" || kind === "json_invalid")
             yield* writeProgress.observe(value.id, "validation_failed", undefined, undefined, kind)
           yield* writeProgress.observe(value.id, "result_observed", undefined, undefined, kind)
