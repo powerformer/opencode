@@ -2400,3 +2400,84 @@ noLLMServer.instance(
     }),
   30_000,
 )
+
+it.instance("native continuation rejects an uncommitted tool before any model request", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const chat = yield* sessions.create({ title: "Continuation safety" })
+    const history = yield* seed(chat.id, { finish: "tool-calls" })
+    yield* sessions.updatePart({
+      id: PartID.ascending(), sessionID: chat.id, messageID: history.assistant.id,
+      type: "tool", callID: "write-once", tool: "bash",
+      state: { status: "pending", input: {}, raw: "" },
+    })
+    yield* llm.text("must not run")
+    const exit = yield* prompt.loop({
+      sessionID: chat.id,
+      continuation: { userMessageID: history.user.id, assistantMessageID: history.assistant.id },
+    }).pipe(Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    expect(yield* llm.calls).toBe(0)
+  }),
+)
+
+it.instance("native continuation consumes a real committed tool result exactly once", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(providerCfg)
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const chat = yield* sessions.create({ title: "Continue once", permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+    const output = path.join(dir, "executions.txt")
+    yield* llm.tool("bash", { command: "printf 'once\\n' >> executions.txt", workdir: dir })
+    yield* llm.fail("fixture interrupts the next model step")
+    yield* prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "write once" }] })
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const committed = messages.find((msg) => msg.info.role === "assistant" && msg.parts.some((part) => part.type === "tool" && part.state.status === "completed"))
+    expect(committed).toBeDefined()
+    if (!committed || committed.info.role !== "assistant") return
+    // Model transport failure persisted a separate failed assistant frame.
+    // Remove that frame to model a process ending before the next step starts.
+    for (const message of messages) {
+      if (message.info.id > committed.info.id) yield* sessions.removeMessage({ sessionID: chat.id, messageID: message.info.id })
+    }
+    const cursor = { userMessageID: committed.info.parentID, assistantMessageID: committed.info.id }
+    const before = yield* Effect.promise(() => Bun.file(output).text())
+    expect(before).toBe("once\n")
+    yield* llm.text("Finished from committed tool output")
+    const final = yield* prompt.loop({ sessionID: chat.id, continuation: cursor })
+    expect(final.parts.some((part) => part.type === "text" && part.text === "Finished from committed tool output")).toBe(true)
+    expect(yield* Effect.promise(() => Bun.file(output).text())).toBe(before)
+    const after = yield* sessions.messages({ sessionID: chat.id })
+    expect(after.filter((msg) => msg.info.role === "user")).toHaveLength(1)
+    expect(after.flatMap((msg) => msg.parts).filter((part) => part.type === "tool")).toHaveLength(1)
+    const attempts = yield* llm.calls
+    const duplicate = yield* prompt.loop({ sessionID: chat.id, continuation: cursor }).pipe(Effect.exit)
+    expect(Exit.isFailure(duplicate)).toBe(true)
+    expect(yield* llm.calls).toBe(attempts)
+  }),
+  { git: true }, 30_000,
+)
+
+it.instance("native continuation rejects a busy session without joining its result", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const gate = yield* Deferred.make<void>()
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Busy continuation" })
+    yield* llm.hold("original", deferredAsPromise(gate))
+    const first = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref,
+      parts: [{ type: "text", text: "original" }] }).pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* waitForBusy(chat.id)
+    const rejected = yield* prompt.loop({ sessionID: chat.id, continuation: {
+      userMessageID: MessageID.ascending(), assistantMessageID: MessageID.ascending(),
+    } }).pipe(Effect.exit)
+    expect(Exit.isFailure(rejected)).toBe(true)
+    expect(yield* llm.calls).toBe(1)
+    yield* Deferred.succeed(gate, undefined)
+    yield* Fiber.join(first)
+  }),
+)

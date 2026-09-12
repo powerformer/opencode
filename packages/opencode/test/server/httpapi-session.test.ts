@@ -1088,3 +1088,18 @@ describe("session HttpApi", () => {
     { git: true, config: { formatter: false, lsp: false } },
   )
 })
+
+it.instance("native continuation route rejects missing sessions and stale cursors", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+    const body = JSON.stringify({ userMessageID: MessageID.ascending(), assistantMessageID: MessageID.ascending() })
+    const missing = yield* request(pathFor(SessionPaths.continue, { sessionID: SessionID.descending() }), { method: "POST", headers, body })
+    expect(missing.status).toBe(404)
+    const chat = yield* createSession({ title: "Stale continuation" })
+    yield* createTextMessage(chat.id, "new input")
+    const stale = yield* request(pathFor(SessionPaths.continue, { sessionID: chat.id }), { method: "POST", headers, body })
+    expect(stale.status).toBe(400)
+  }),
+  { git: true }, 30_000,
+)

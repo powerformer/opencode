@@ -1078,8 +1078,8 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    const runLoop: (sessionID: SessionID, continuation?: LoopInput["continuation"]) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
+      function* (sessionID: SessionID, continuation?: LoopInput["continuation"]) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
@@ -1094,6 +1094,23 @@ const layer = Layer.effect(
           )
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+
+          if (step === 0 && continuation) {
+            // Validate inside the serialized runner, against persisted history.
+            // A continuation never inserts a user message or re-executes tools.
+            if (lastUser?.id !== continuation.userMessageID || lastAssistant?.id !== continuation.assistantMessageID) {
+              throw new ContinuationRejected("session cursor changed")
+            }
+            if (lastAssistant.error || lastAssistant.finish !== "tool-calls") {
+              throw new ContinuationRejected("assistant is not awaiting tool continuation")
+            }
+            const tools = msgs.flatMap((msg) => msg.parts).filter((part) => part.type === "tool")
+            if (!tools.length || tools.some((part) =>
+              !["completed", "error"].includes(part.state.status) || isOrphanedInterruptedTool(part)
+            )) {
+              throw new ContinuationRejected("tool results are not committed")
+            }
+          }
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
@@ -1343,6 +1360,11 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
+      if (input.continuation) {
+        return yield* state.startExclusive(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID, input.continuation)).pipe(
+          Effect.catchTag("SessionBusyError", () => Effect.die(new ContinuationRejected("session is busy"))),
+        )
+      }
       return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
     })
 
@@ -1520,8 +1542,16 @@ export const PromptInput = Schema.Struct({
 })
 export type PromptInput = Schema.Schema.Type<typeof PromptInput>
 
+export class ContinuationRejected extends Error {}
+
+export const ContinuationCursor = Schema.Struct({
+  userMessageID: MessageID,
+  assistantMessageID: MessageID,
+})
+
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,
+  continuation: Schema.optional(ContinuationCursor),
 }) {}
 
 export const ShellInput = Schema.Struct({

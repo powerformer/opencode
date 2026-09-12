@@ -308,6 +308,19 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       })
     })
 
+    const continueSession = Effect.fn("SessionHttpApi.continue")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: typeof SessionPrompt.ContinuationCursor.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      yield* runState.assertNotBusy(ctx.params.sessionID).pipe(SessionError.mapBusy)
+      return yield* promptSvc.loop({ sessionID: ctx.params.sessionID, continuation: ctx.payload }).pipe(
+        Effect.catchCause((cause) => Cause.squash(cause) instanceof SessionPrompt.ContinuationRejected
+          ? Effect.fail(new HttpApiError.BadRequest({}))
+          : Effect.failCause(cause)),
+      )
+    })
+
     const promptAsync = Effect.fn("SessionHttpApi.promptAsync")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type
@@ -430,6 +443,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("summarize", summarize)
       .handle("prompt", prompt)
       .handle("promptAsync", promptAsync)
+      .handle("continue", continueSession)
       .handle("command", command)
       .handle("shell", shell)
       .handle("revert", revert)

@@ -1499,6 +1499,39 @@ const scenarios: Scenario[] = [
       }),
     ),
   http.protected
+    .post("/session/{sessionID}/continue", "session.continue.missing")
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/continue", { sessionID: "ses_httpapi_missing" }),
+      headers: ctx.headers(),
+      body: { userMessageID: "msg_httpapi_user", assistantMessageID: "msg_httpapi_assistant" },
+    }))
+    .status(404),
+  http.protected
+    .post("/session/{sessionID}/continue", "session.continue.stale")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Stale continuation" })
+        const message = yield* ctx.message(session.id, { text: "Original request" })
+        return { session, message }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/continue", { sessionID: ctx.state.session.id }),
+      headers: ctx.headers(),
+      body: { userMessageID: ctx.state.message.info.id, assistantMessageID: "msg_httpapi_stale" },
+    }))
+    .status(400, (ctx) =>
+      Effect.gen(function* () {
+        const messages = yield* ctx.messages(ctx.state.session.id)
+        check(messages.length === 1, "rejected continuation must not append messages")
+        check(
+          messages[0]?.info.id === ctx.state.message.info.id,
+          "rejected continuation must preserve the original request",
+        )
+      }),
+    ),
+  http.protected
     .post("/session/{sessionID}/command", "session.command")
     .preserveDatabase()
     .withLlm()

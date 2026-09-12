@@ -512,3 +512,18 @@ describe("Runner", () => {
     }),
   )
 })
+
+it.live("exclusive admission rejects concurrent work without joining or executing it", Effect.gen(function* () {
+  const scope = yield* Scope.Scope
+  const runner = Runner.make<string>(scope)
+  const gate = yield* Deferred.make<string>()
+  const first = yield* runner.startExclusive(Deferred.await(gate)).pipe(Effect.forkChild)
+  yield* waitForState(runner, "Running")
+  const calls = yield* Ref.make(0)
+  const duplicate = yield* runner.startExclusive(Ref.update(calls, (n) => n + 1).pipe(Effect.as("duplicate"))).pipe(Effect.exit)
+  expect(Exit.isFailure(duplicate)).toBe(true)
+  expect(yield* Ref.get(calls)).toBe(0)
+  yield* Deferred.succeed(gate, "first")
+  expect(yield* Fiber.join(first)).toBe("first")
+  expect(yield* runner.startExclusive(Effect.succeed("next"))).toBe("next")
+}))
